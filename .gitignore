@@ -1,0 +1,4 @@
+.env
+ProductionCertificate.cer
+credential.js
+/node_modules
