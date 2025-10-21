@@ -11,6 +11,10 @@ const rateLimit = require("express-rate-limit");
 const crypto = require('crypto');
 const { env } = require("process");
 
+// At the top, add imports
+const { Server } = require('socket.io');
+const xss = require('xss');  // For sanitizing user input
+
 dotenv.config();
 
 const app = express();
@@ -341,6 +345,64 @@ pool.query(`
             );
         `);
         console.log("Subscription tiers table ready");
+
+        // Conversations table
+pool.query(`
+    CREATE TABLE IF NOT EXISTS conversations (
+        id SERIAL PRIMARY KEY,
+        user1_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        user2_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMP DEFAULT NOW(),
+        last_message_at TIMESTAMP,
+        UNIQUE (user1_id, user2_id)
+    )
+`).then(() => console.log("Conversations table ready"))
+  .catch(err => console.error("Error creating conversations table:", err));
+
+// Messages table
+pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+        sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        read_at TIMESTAMP,
+        status VARCHAR(20) DEFAULT 'sent'
+    )
+`).then(() => console.log("Messages table ready"))
+  .catch(err => console.error("Error creating messages table:", err));
+
+// Indexes for performance
+pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_conversations_user1 ON conversations(user1_id);
+    CREATE INDEX IF NOT EXISTS idx_conversations_user2 ON conversations(user2_id);
+    CREATE INDEX IF NOT EXISTS idx_conversations_last_message ON conversations(last_message_at);
+    CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+`).then(() => console.log("Messaging indexes ready"))
+  .catch(err => console.error("Error creating messaging indexes:", err));
+
+// Trigger to update last_message_at (using PostgreSQL function)
+pool.query(`
+    CREATE OR REPLACE FUNCTION update_conversation_timestamp()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        UPDATE conversations
+        SET last_message_at = NEW.created_at
+        WHERE id = NEW.conversation_id;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+`).then(() => {
+    pool.query(`
+        CREATE TRIGGER trg_update_conversation_timestamp
+        AFTER INSERT ON messages
+        FOR EACH ROW EXECUTE FUNCTION update_conversation_timestamp();
+    `).then(() => console.log("Conversation timestamp trigger ready"))
+      .catch(err => console.error("Error creating trigger:", err));
+}).catch(err => console.error("Error creating function:", err));
 
 
 });
@@ -2843,6 +2905,199 @@ app.get("/creators/:creatorId/transactions/export", authenticateToken, async (re
     }
 });
 
-app.listen(port, () => {
-    console.log(`🚀 Server running on port ${port}`);
+// app.listen(port, () => {
+//     console.log(`🚀 Server running on port ${port}`);
+// });
+
+// After create HTTP server if not already (replace app.listen with this)
+const server = require('http').createServer(app);
+const io = new Server(server, {
+    cors: { origin: '*' }  // Adjust for production (e.g., your frontend URL)
 });
+server.listen(port, () => console.log(`🚀 Server running on port ${port}`));
+
+// Add this before io setup
+app.get('/users/search', authenticateToken, async (req, res) => {
+    const { query } = req.query;
+    if (!query) return res.status(400).json({ error: 'Query required' });
+    try {
+        const result = await pool.query(
+            `SELECT id, name, (SELECT profile_image FROM creators_page WHERE user_id = users.id) AS profile_image 
+             FROM users WHERE name ILIKE $1 AND id != $2 LIMIT 10`,
+            [`%${query}%`, req.user.id]  // Exclude self
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('User search error:', error);
+        res.status(500).json({ error: 'Search failed' });
+    }
+});
+
+// Socket.io auth middleware (using your JWT)
+io.use((socket, next) => {
+    const token = socket.handshake.auth.token;
+    if (!token) return next(new Error('Authentication required'));
+    jwt.verify(token, secretKey, (err, user) => {
+        if (err) return next(new Error('Invalid token'));
+        socket.user = user;  // Attach user to socket
+        next();
+    });
+});
+
+// Socket.io connection handler
+io.on('connection', (socket) => {
+    console.log(`User ${socket.user.id} connected`);
+    socket.join(`user:${socket.user.id}`);  // User-specific room for private messages
+
+    // Presence (basic online/offline)
+    io.emit('user:online', { userId: socket.user.id });
+    socket.on('disconnect', () => {
+        io.emit('user:offline', { userId: socket.user.id });
+    });
+
+    // Typing indicator
+    socket.on('typing', ({ conversationId, isTyping }) => {
+        socket.to(`conversation:${conversationId}`).emit('typing', { userId: socket.user.id, isTyping });
+    });
+
+    // Send message
+    socket.on('send:message', async ({ conversationId, content }) => {
+        if (!content.trim()) return socket.emit('error', { message: 'Empty message' });
+        const sanitizedContent = xss(content);  // Sanitize
+
+        try {
+            // Validate conversation access
+            const convoCheck = await pool.query(
+                `SELECT id FROM conversations WHERE id = $1 AND (user1_id = $2 OR user2_id = $2)`,
+                [conversationId, socket.user.id]
+            );
+            if (convoCheck.rowCount === 0) throw new Error('Unauthorized access');
+
+            // Insert to DB
+            const result = await pool.query(
+                `INSERT INTO messages (conversation_id, sender_id, content) VALUES ($1, $2, $3) RETURNING *`,
+                [conversationId, socket.user.id, sanitizedContent]
+            );
+            const message = result.rows[0];
+
+            // Emit to conversation room (both users)
+            io.to(`conversation:${conversationId}`).emit('new:message', message);
+
+            // Optional: Send notification to recipient if offline
+            // (Integrate with your notifications system here)
+        } catch (error) {
+            console.error('Send message error:', error);
+            socket.emit('error', { message: error.message });
+        }
+    });
+
+    // Read receipt
+    socket.on('read:message', async ({ messageId, conversationId }) => {
+        try {
+            await pool.query(
+                `UPDATE messages SET read_at = NOW(), status = 'read' WHERE id = $1 AND conversation_id = $2`,
+                [messageId, conversationId]
+            );
+            socket.to(`conversation:${conversationId}`).emit('message:read', { messageId });
+        } catch (error) {
+            console.error('Read receipt error:', error);
+        }
+    });
+
+    // Join conversation room (called from frontend on chat open)
+    socket.on('join:conversation', ({ conversationId }) => {
+        socket.join(`conversation:${conversationId}`);
+    });
+});
+
+// REST Endpoints (for history and starting convos; authenticate with your middleware)
+
+// GET /conversations - Fetch user's conversations with previews
+app.get('/conversations', authenticateToken, async (req, res) => {
+    const userId = req.user.id;
+    try {
+        const result = await pool.query(`
+            SELECT 
+                c.id, 
+                CASE WHEN c.user1_id = $1 THEN u2.name ELSE u1.name END AS recipient_name,
+                CASE WHEN c.user1_id = $1 THEN u2.id ELSE u1.id END AS recipient_id,
+                m.content AS last_message,
+                m.created_at AS last_message_at
+            FROM conversations c
+            LEFT JOIN users u1 ON c.user1_id = u1.id
+            LEFT JOIN users u2 ON c.user2_id = u2.id
+            LEFT JOIN LATERAL (
+                SELECT content, created_at FROM messages 
+                WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1
+            ) m ON true
+            WHERE c.user1_id = $1 OR c.user2_id = $1
+            ORDER BY COALESCE(m.created_at, c.created_at) DESC
+        `, [userId]);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Fetch conversations error:', error);
+        res.status(500).json({ error: 'Failed to fetch conversations' });
+    }
+});
+
+// GET /conversations/:id/messages - Paginated history
+app.get('/conversations/:id/messages', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const { limit = 50, offset = 0 } = req.query;
+    try {
+        // Validate access
+        const accessCheck = await pool.query(
+            `SELECT id FROM conversations WHERE id = $1 AND (user1_id = $2 OR user2_id = $2)`,
+            [id, userId]
+        );
+        if (accessCheck.rowCount === 0) return res.status(403).json({ error: 'Unauthorized' });
+
+        const result = await pool.query(`
+            SELECT m.*, u.name AS sender_name 
+            FROM messages m
+            JOIN users u ON m.sender_id = u.id
+            WHERE m.conversation_id = $1
+            ORDER BY m.created_at DESC
+            LIMIT $2 OFFSET $3
+        `, [id, limit, offset]);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Fetch messages error:', error);
+        res.status(500).json({ error: 'Failed to fetch messages' });
+    }
+});
+
+// POST /conversations - Start new conversation (if not exists)
+app.post('/conversations', authenticateToken, async (req, res) => {
+    const userId = req.user.id;
+    const { recipientId } = req.body;
+    if (userId === recipientId) return res.status(400).json({ error: 'Cannot message yourself' });
+
+// In POST /conversations
+try {
+    const [user1, user2] = [userId, recipientId].sort((a, b) => a - b);
+    const insertResult = await pool.query(`
+        INSERT INTO conversations (user1_id, user2_id)
+        VALUES ($1, $2)
+        ON CONFLICT (user1_id, user2_id) DO NOTHING
+        RETURNING id
+    `, [user1, user2]);
+
+    let conversationId;
+    if (insertResult.rowCount > 0) {
+        conversationId = insertResult.rows[0].id;
+    } else {
+        const selectResult = await pool.query(`
+            SELECT id FROM conversations WHERE user1_id = $1 AND user2_id = $2
+        `, [user1, user2]);
+        if (selectResult.rowCount === 0) throw new Error('Conversation not found after insert attempt');
+        conversationId = selectResult.rows[0].id;
+    }
+    res.json({ conversationId });
+} catch (error) {
+    console.error('Start conversation error:', error);
+    res.status(500).json({ error: 'Failed to start conversation' });
+}
+});
+
