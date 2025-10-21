@@ -3073,8 +3073,7 @@ app.post('/conversations', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     const { recipientId } = req.body;
     if (userId === recipientId) return res.status(400).json({ error: 'Cannot message yourself' });
-
-// In POST /conversations
+        // In POST /conversations
 try {
     const [user1, user2] = [userId, recipientId].sort((a, b) => a - b);
     const insertResult = await pool.query(`
