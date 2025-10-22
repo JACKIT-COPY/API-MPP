@@ -395,16 +395,25 @@ pool.query(`
         RETURN NEW;
     END;
     $$ LANGUAGE plpgsql;
-`).then(() => {
-    pool.query(`
+`)
+.then(() => {
+    // Drop the trigger first if it exists
+    return pool.query(`
+        DROP TRIGGER IF EXISTS trg_update_conversation_timestamp ON messages;
+    `);
+})
+.then(() => {
+    // Create the trigger again
+    return pool.query(`
         CREATE TRIGGER trg_update_conversation_timestamp
         AFTER INSERT ON messages
         FOR EACH ROW EXECUTE FUNCTION update_conversation_timestamp();
-    `).then(() => console.log("Conversation timestamp trigger ready"))
-      .catch(err => console.error("Error creating trigger:", err));
-}).catch(err => console.error("Error creating function:", err));
-
-
+    `);
+})
+.then(() => console.log("Conversation timestamp trigger ready"))
+.catch(err => {
+    console.error("Error creating trigger/function:", err);
+});
 });
 
 // Middleware to verify JWT
