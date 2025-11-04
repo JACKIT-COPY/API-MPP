@@ -884,100 +884,137 @@ app.post("/subscribe", authenticateToken, async (req, res) => {
     const userId = req.user.id;
 
     try {
-        // ====================== 1. INPUT VALIDATION (unchanged) ======================
-        if (!creator_id || isNaN(creator_id)) return res.status(400).json({ error: "Invalid creator ID" });
-        if (!tier_id || isNaN(tier_id)) return res.status(400).json({ error: "Invalid tier ID" });
-        if (!plan) return res.status(400).json({ error: "Plan is required" });
-        if (!duration_days || isNaN(duration_days) || duration_days < 1 || duration_days > 365)
+        // Validate inputs
+        if (!creator_id || isNaN(creator_id)) {
+            return res.status(400).json({ error: "Invalid creator ID" });
+        }
+        if (!tier_id || isNaN(tier_id)) {
+            return res.status(400).json({ error: "Invalid tier ID" });
+        }
+        if (!plan) {
+            return res.status(400).json({ error: "Plan is required" });
+        }
+        if (!duration_days || isNaN(duration_days) || duration_days < 1 || duration_days > 365) {
             return res.status(400).json({ error: "Invalid duration, must be between 1 and 365 days" });
-        if (!amount || isNaN(amount) || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
-        if (!['mpesa', 'card'].includes(payment_method))
+        }
+        if (!amount || isNaN(amount) || amount <= 0) {
+            return res.status(400).json({ error: "Invalid amount" });
+        }
+        if (!['mpesa', 'card'].includes(payment_method)) {
             return res.status(400).json({ error: "Invalid payment method. Must be 'mpesa' or 'card'" });
-        if (!payment_details || typeof payment_details !== 'object')
+        }
+        if (!payment_details || typeof payment_details !== 'object') {
             return res.status(400).json({ error: "Payment details are required" });
+        }
         if (payment_method === 'mpesa') {
-            if (!payment_details.phone || !/^254\d{9}$/.test(payment_details.phone))
+            if (!payment_details.phone || !/^254\d{9}$/.test(payment_details.phone)) {
                 return res.status(400).json({ error: "Invalid M-Pesa phone number" });
+            }
         } else {
             return res.status(400).json({ error: "Card payments are not yet supported" });
         }
-        if (parseInt(creator_id) === userId)
+        if (parseInt(creator_id) === userId) {
             return res.status(400).json({ error: "Cannot subscribe to yourself" });
+        }
 
-        // ====================== 2. CREATOR & TIER CHECKS (unchanged) ======================
+        // Verify creator exists
         const creatorResult = await pool.query(
             `SELECT u.id FROM users u JOIN creators_page cp ON u.id = cp.user_id WHERE u.id = $1`,
             [creator_id]
         );
-        if (creatorResult.rowCount === 0)
+        if (creatorResult.rowCount === 0) {
             return res.status(404).json({ error: "Creator not found or not a creator account" });
+        }
+
         // Validate tier
         const tierResult = await pool.query(
             `SELECT id, name, price, interval FROM subscription_tiers 
              WHERE id = $1 AND creator_id = $2 AND interval IN ('month', 'day')`,
             [tier_id, creator_id]
         );
-        if (tierResult.rowCount === 0)
+        if (tierResult.rowCount === 0) {
             return res.status(404).json({ error: "Subscription tier not found, not owned by creator, or not Monthly/Daily" });
+        }
 
         const tier = tierResult.rows[0];
 
-        // ====================== 3. DURATION & AMOUNT VALIDATION (unchanged) ======================
+        // Validate duration and amount
         let validatedDuration = duration_days;
         let validatedAmount = amount;
         if (tier.interval === 'month') {
-            if (duration_days !== 30)
+            if (duration_days !== 30) {
                 return res.status(400).json({ error: "Monthly plans must have a duration of 30 days" });
-            if (amount !== tier.price)
+            }
+            if (amount !== tier.price) {
                 return res.status(400).json({ error: `Amount must be ${tier.price} for monthly plan` });
+            }
         } else if (tier.interval === 'day') {
-            if (amount !== tier.price * duration_days)
+            if (amount !== tier.price * duration_days) {
                 return res.status(400).json({ error: `Amount must be ${tier.price} * ${duration_days} = ${tier.price * duration_days} for daily plan` });
+            }
         }
 
-        // ====================== 4. DATE CALCULATION ======================
+        // Check for existing active subscription
+        const existingSub = await pool.query(
+            `SELECT id FROM subscriptions WHERE user_id = $1 AND creator_id = $2 AND end_date > CURRENT_DATE AND payment_status = 'completed'`,
+            [userId, creator_id]
+        );
+        if (existingSub.rowCount > 0) {
+            return res.status(400).json({ error: "You already have an active subscription to this creator" });
+        }
+
+        // Check for pending or failed subscription
+        const pendingOrFailedSub = await pool.query(
+            `SELECT id FROM subscriptions WHERE user_id = $1 AND creator_id = $2 AND payment_status IN ('pending', 'failed')`,
+            [userId, creator_id]
+        );
+
+        // Calculate dates
         const startDate = new Date().toISOString().split('T')[0];
         const endDate = new Date();
         endDate.setUTCDate(endDate.getUTCDate() + validatedDuration);
         const endDateStr = endDate.toISOString().split('T')[0];
 
-        // ====================== 5. UPSERT: INSERT OR UPDATE (ATOMIC) ======================
-        const upsertResult = await pool.query(`
-            INSERT INTO subscriptions 
-              (user_id, creator_id, plan, start_date, end_date, amount, payment_method, payment_status, mpesa_transaction_id)
-            VALUES 
-              ($1, $2, $3, $4, $5, $6, $7, 'pending', NULL)
-            ON CONFLICT (user_id, creator_id) DO UPDATE SET
-              plan = EXCLUDED.plan,
-              start_date = EXCLUDED.start_date,
-              end_date = EXCLUDED.end_date,
-              amount = EXCLUDED.amount,
-              payment_method = EXCLUDED.payment_method,
-              payment_status = 'pending',
-              mpesa_transaction_id = NULL
-            WHERE 
-              NOT (subscriptions.payment_status = 'completed' AND subscriptions.end_date > CURRENT_DATE)
-            RETURNING id, user_id, creator_id, plan, start_date, end_date, amount, payment_method, payment_status
-        `, [
-            userId,
-            creator_id,
-            tier.name,
-            startDate,
-            endDateStr,
-            validatedAmount,
-            payment_method
-        ]);
-
-        // If UPSERT returns 0 rows → active subscription exists
-        if (upsertResult.rowCount === 0) {
-            return res.status(400).json({ error: "You already have an active subscription to this creator" });
+        let result;
+        if (pendingOrFailedSub.rowCount > 0) {
+            // Update existing pending/failed subscription
+            result = await pool.query(
+                `UPDATE subscriptions 
+                 SET plan = $1, start_date = $2, end_date = $3, amount = $4, payment_method = $5, payment_status = $6, mpesa_transaction_id = NULL
+                 WHERE id = $7
+                 RETURNING id, user_id, creator_id, plan, start_date, end_date, amount, payment_method, payment_status`,
+                [
+                    tier.name,
+                    startDate,
+                    endDateStr,
+                    validatedAmount,
+                    payment_method,
+                    'pending',
+                    pendingOrFailedSub.rows[0].id
+                ]
+            );
+        } else {
+            // Insert new subscription
+            result = await pool.query(
+                `INSERT INTO subscriptions (user_id, creator_id, plan, start_date, end_date, amount, payment_method, payment_status)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 RETURNING id, user_id, creator_id, plan, start_date, end_date, amount, payment_method, payment_status`,
+                [
+                    userId,
+                    creator_id,
+                    tier.name,
+                    startDate,
+                    endDateStr,
+                    validatedAmount,
+                    payment_method,
+                    'pending'
+                ]
+            );
         }
 
-        const subscription = upsertResult.rows[0];
-
-        // ====================== 6. M-PESA STK PUSH (unchanged) ======================
+        // Trigger STK Push for M-Pesa
         if (payment_method === 'mpesa') {
-            const subscriptionId = subscription.id;
+            const subscriptionId = result.rows[0].id;
             const phoneNumber = payment_details.phone;
 
             const stkResponse = await axios.post(
@@ -987,23 +1024,20 @@ app.post("/subscribe", authenticateToken, async (req, res) => {
             );
 
             if (!stkResponse.data.success) {
-                console.error("STK Push failed:", stkResponse.data);
+                console.error("STK Push Response:", stkResponse.data);
                 await pool.query("DELETE FROM subscriptions WHERE id = $1", [subscriptionId]);
                 return res.status(500).json({ error: "Failed to initiate M-Pesa payment", details: stkResponse.data.error });
             }
         }
 
-        // ====================== 7. SUCCESS ======================
         res.status(201).json({
             message: "Subscription created or updated, payment initiated",
-            subscription
+            subscription: result.rows[0]
         });
-
     } catch (error) {
         console.error("Subscribe error:", error);
-        // Only 23505 should no longer happen — but keep for safety
         if (error.code === "23505") {
-            return res.status(400).json({ error: "Subscription conflict – please try again" });
+            return res.status(400).json({ error: "Subscription already exists" });
         }
         res.status(500).json({
             error: "Failed to create or update subscription",
