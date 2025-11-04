@@ -954,50 +954,80 @@ app.post("/subscribe", authenticateToken, async (req, res) => {
             }
         }
 
-        // Check for existing active subscription
-        const existingSub = await pool.query(
-            `SELECT id FROM subscriptions WHERE user_id = $1 AND creator_id = $2 AND end_date > CURRENT_DATE AND payment_status = 'completed'`,
-            [userId, creator_id]
-        );
-        if (existingSub.rowCount > 0) {
-            return res.status(400).json({ error: "You already have an active subscription to this creator" });
-        }
-
-        // Check for pending or failed subscription
-        const pendingOrFailedSub = await pool.query(
-            `SELECT id FROM subscriptions WHERE user_id = $1 AND creator_id = $2 AND payment_status IN ('pending', 'failed')`,
-            [userId, creator_id]
-        );
-
         // Calculate dates
         const startDate = new Date().toISOString().split('T')[0];
         const endDate = new Date();
         endDate.setUTCDate(endDate.getUTCDate() + validatedDuration);
         const endDateStr = endDate.toISOString().split('T')[0];
+        const todayStr = new Date().toISOString().split('T')[0];
+
+        // -----------------------------------------------------------------
+        // 1. Check for ANY existing subscription (with row lock)
+        // -----------------------------------------------------------------
+        const anySubRes = await pool.query(
+            `SELECT id, payment_status, end_date
+               FROM subscriptions
+              WHERE user_id = $1 AND creator_id = $2
+              FOR UPDATE`,
+            [userId, creator_id]
+        );
 
         let result;
-        if (pendingOrFailedSub.rowCount > 0) {
-            // Update existing pending/failed subscription
-            result = await pool.query(
-                `UPDATE subscriptions 
-                 SET plan = $1, start_date = $2, end_date = $3, amount = $4, payment_method = $5, payment_status = $6, mpesa_transaction_id = NULL
-                 WHERE id = $7
-                 RETURNING id, user_id, creator_id, plan, start_date, end_date, amount, payment_method, payment_status`,
-                [
-                    tier.name,
-                    startDate,
-                    endDateStr,
-                    validatedAmount,
-                    payment_method,
-                    'pending',
-                    pendingOrFailedSub.rows[0].id
-                ]
-            );
-        } else {
-            // Insert new subscription
+
+        if (anySubRes.rowCount > 0) {
+            const sub = anySubRes.rows[0];
+
+            // a) Active completed subscription → block
+            if (sub.payment_status === 'completed' && sub.end_date > todayStr) {
+                return res.status(400).json({ error: "You already have an active subscription to this creator" });
+            }
+
+            // b) Pending or failed → reuse (UPDATE)
+            if (['pending', 'failed'].includes(sub.payment_status)) {
+                result = await pool.query(
+                    `UPDATE subscriptions 
+                       SET plan = $1, start_date = $2, end_date = $3, amount = $4, 
+                           payment_method = $5, payment_status = 'pending', mpesa_transaction_id = NULL
+                     WHERE id = $6
+                     RETURNING id, user_id, creator_id, plan, start_date, end_date, amount, payment_method, payment_status`,
+                    [
+                        tier.name,
+                        startDate,
+                        endDateStr,
+                        validatedAmount,
+                        payment_method,
+                        sub.id
+                    ]
+                );
+            }
+            // c) Completed but EXPIRED → overwrite (UPDATE same row)
+            else if (sub.payment_status === 'completed' && sub.end_date <= todayStr) {
+                result = await pool.query(
+                    `UPDATE subscriptions 
+                       SET plan = $1, start_date = $2, end_date = $3, amount = $4, 
+                           payment_method = $5, payment_status = 'pending', mpesa_transaction_id = NULL
+                     WHERE id = $6
+                     RETURNING id, user_id, creator_id, plan, start_date, end_date, amount, payment_method, payment_status`,
+                    [
+                        tier.name,
+                        startDate,
+                        endDateStr,
+                        validatedAmount,
+                        payment_method,
+                        sub.id
+                    ]
+                );
+            }
+            // (any other status → fall through to INSERT)
+        }
+
+        // -----------------------------------------------------------------
+        // 2. No subscription at all → INSERT new
+        // -----------------------------------------------------------------
+        if (!result) {
             result = await pool.query(
                 `INSERT INTO subscriptions (user_id, creator_id, plan, start_date, end_date, amount, payment_method, payment_status)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
                  RETURNING id, user_id, creator_id, plan, start_date, end_date, amount, payment_method, payment_status`,
                 [
                     userId,
@@ -1006,13 +1036,14 @@ app.post("/subscribe", authenticateToken, async (req, res) => {
                     startDate,
                     endDateStr,
                     validatedAmount,
-                    payment_method,
-                    'pending'
+                    payment_method
                 ]
             );
         }
 
-        // Trigger STK Push for M-Pesa
+        // -----------------------------------------------------------------
+        // 3. Trigger STK Push for M-Pesa
+        // -----------------------------------------------------------------
         if (payment_method === 'mpesa') {
             const subscriptionId = result.rows[0].id;
             const phoneNumber = payment_details.phone;
@@ -1034,10 +1065,11 @@ app.post("/subscribe", authenticateToken, async (req, res) => {
             message: "Subscription created or updated, payment initiated",
             subscription: result.rows[0]
         });
+
     } catch (error) {
         console.error("Subscribe error:", error);
         if (error.code === "23505") {
-            return res.status(400).json({ error: "Subscription already exists" });
+            return res.status(400).json({ error: "Subscription conflict – please try again" });
         }
         res.status(500).json({
             error: "Failed to create or update subscription",
