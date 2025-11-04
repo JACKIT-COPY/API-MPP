@@ -206,10 +206,12 @@ pool.query(`
             payment_method VARCHAR(50),
             mpesa_transaction_id VARCHAR(50),
             payment_status VARCHAR(20) DEFAULT 'pending',
-            UNIQUE(user_id, creator_id)
+
         )
     `).then(() => console.log("Subscriptions table ready"))
       .catch(err => console.error("Error creating subscriptions table:", err));
+
+    //       removed constraint      // UNIQUE(user_id, creator_id)
 
     // Add payment_status column if missing
     pool.query(`
