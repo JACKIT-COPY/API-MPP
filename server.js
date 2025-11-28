@@ -1164,50 +1164,61 @@ app.post("/login", async (req, res) => {
 });
 
 // Verify token
-// GET /verify — now returns complete creator-aware user object
+// GET /verify — Fully compatible with your real database schema
 app.get("/verify", authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.id;
+  try {
+    const userId = req.user.id;
 
-        // Fetch user + creator page in one query
-        const result = await pool.query(
-            `SELECT 
-                u.id, u.name, u.email, u.bio, u.categories, u.role, u.is_creator,
-                u.profile_image AS user_profile_image,
-                cp.profile_image AS creator_profile_image,
-                cp.bio AS creator_bio,
-                cp.socials
-             FROM users u
-             LEFT JOIN creators_page cp ON u.id = cp.user_id
-             WHERE u.id = $1`,
-            [userId]
-        );
+    const result = await pool.query(
+      `SELECT 
+          u.id,
+          u.name,
+          u.email,
+          u.bio,
+          u.categories,
+          u.role,
+          u.is_creator,
+          cp.profile_image,
+          cp.bio AS creator_bio,
+          cp.socials
+       FROM users u
+       LEFT JOIN creators_page cp ON u.id = cp.user_id
+       WHERE u.id = $1`,
+      [userId]
+    );
 
-        if (result.rowCount === 0) {
-            return res.status(404).json({ error: "User not found" });
-        }
-
-        const row = result.rows[0];
-
-        res.json({
-            user: {
-                id: row.id,
-                name: row.name,
-                email: row.email,
-                bio: row.creator_bio || row.bio || "",
-                categories: row.categories || [],
-                profile_image: row.creator_profile_image || row.user_profile_image || `https://placehold.co/400x400?text=${encodeURIComponent(row.name.charAt(0))}`,
-                profileImage: row.creator_profile_image || row.user_profile_image || `https://placehold.co/400x400?text=${encodeURIComponent(row.name.charAt(0))}`,
-                isCreator: !!row.is_creator || row.creator_profile_image !== null, // double safety
-                role: row.role,
-                socials: row.socials || {}
-            }
-        });
-
-    } catch (error) {
-        console.error("Verify error:", error);
-        res.status(500).json({ error: "Server error", details: error.message });
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "User not found" });
     }
+
+    const row = result.rows[0];
+
+    // Determine final profile image (priority: creators_page → fallback placeholder)
+    const finalProfileImage = row.profile_image || 
+      `https://placehold.co/400x400?text=${encodeURIComponent(row.name.charAt(0).toUpperCase())}`;
+
+    res.json({
+      user: {
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        bio: row.creator_bio || row.bio || "Hey there! I just joined MyPaidPost",
+        categories: row.categories || [],
+        profile_image: finalProfileImage,
+        profileImage: finalProfileImage,  // both for backward compat
+        isCreator: !!row.is_creator || !!row.profile_image,  // true if either exists
+        role: row.role || "user",
+        socials: row.socials || {}
+      }
+    });
+
+  } catch (error) {
+    console.error("Verify error:", error.message);
+    res.status(500).json({ 
+      error: "Server error", 
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined 
+    });
+  }
 });
 
 // Update Profile
