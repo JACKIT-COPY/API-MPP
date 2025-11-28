@@ -1051,12 +1051,21 @@ app.post("/subscribe", authenticateToken, async (req, res) => {
 // Signup
 app.post("/signup", async (req, res) => {
     const { name, email, password, moderatorId, moderator, role } = req.body;
+
     try {
         if (!name || !email || !password) {
             return res.status(400).json({ error: "Name, email, and password are required" });
         }
 
+        // Check if email already exists
+        const existingUser = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+        if (existingUser.rowCount > 0) {
+            return res.status(400).json({ error: "Email already exists" });
+        }
+
         const hashedPassword = await bcrypt.hash(password, 10);
+
+        // Moderator logic (unchanged — preserved)
         let finalModeratorId = moderatorId || 'Md-1';
         if (moderatorId) {
             const moderatorResult = await pool.query(
@@ -1079,12 +1088,51 @@ app.post("/signup", async (req, res) => {
         );
         const userModerationId = `Md-${sequenceResult.rows[0].seq}`;
 
-        const result = await pool.query(
-            "INSERT INTO users (name, email, password, moderator_id, moderator, user_moderation_id, role) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, name, email, moderator_id, moderator, user_moderation_id, role",
-            [name, email, hashedPassword, finalModeratorId, moderator || '', userModerationId, finalRole]
+        // === START TRANSACTION: Create user + creator profile atomically ===
+        await pool.query("BEGIN");
+
+        // 1. Create user (is_creator defaults to FALSE in table, but we'll set it later)
+        const userResult = await pool.query(
+            `INSERT INTO users (
+                name, email, password, moderator_id, moderator, 
+                user_moderation_id, role, is_creator
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+             RETURNING id, name, email, moderator_id, moderator, user_moderation_id, role`,
+            [name.trim(), email.toLowerCase(), hashedPassword, finalModeratorId, moderator || '', userModerationId, finalRole]
         );
-        res.status(201).json({ message: "User created", user: result.rows[0] });
+
+        const user = userResult.rows[0];
+
+        // 2. Automatically create creators_page entry
+        await pool.query(
+            `INSERT INTO creators_page (user_id, profile_image, bio, socials, updated_at)
+             VALUES ($1, $2, $3, $4, NOW())
+             ON CONFLICT (user_id) DO NOTHING`,
+            [
+                user.id,
+                `https://placehold.co/400x400?text=${encodeURIComponent(name.charAt(0).toUpperCase())}`,
+                "Hey there! I just joined MyPaidPost",
+                {} // empty socials
+            ]
+        );
+
+        await pool.query("COMMIT");
+
+        console.log(`New creator signed up: ${name} (${email}) → ID: ${user.id}`);
+
+        res.status(201).json({
+            message: "Account created successfully! You are now a creator.",
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                isCreator: true,
+                role: user.role
+            }
+        });
+
     } catch (error) {
+        await pool.query("ROLLBACK");
         if (error.code === "23505") {
             res.status(400).json({ error: "Email already exists" });
         } else {
@@ -1116,39 +1164,46 @@ app.post("/login", async (req, res) => {
 });
 
 // Verify token
+// GET /verify — now returns complete creator-aware user object
 app.get("/verify", authenticateToken, async (req, res) => {
     try {
-        const userResult = await pool.query(
-            "SELECT id, name, email, bio, categories, role FROM users WHERE id = $1",
-            [req.user.id]
-        );
-        const user = userResult.rows[0];
-        if (!user) return res.status(404).json({ error: "User not found" });
+        const userId = req.user.id;
 
-        const creatorPageResult = await pool.query(
-            "SELECT profile_image FROM creators_page WHERE user_id = $1",
-            [req.user.id]
+        // Fetch user + creator page in one query
+        const result = await pool.query(
+            `SELECT 
+                u.id, u.name, u.email, u.bio, u.categories, u.role, u.is_creator,
+                u.profile_image AS user_profile_image,
+                cp.profile_image AS creator_profile_image,
+                cp.bio AS creator_bio,
+                cp.socials
+             FROM users u
+             LEFT JOIN creators_page cp ON u.id = cp.user_id
+             WHERE u.id = $1`,
+            [userId]
         );
-        const profileImage = creatorPageResult.rows[0]?.profile_image || null;
 
-        const creatorResult = await pool.query(
-            "SELECT user_id FROM creators_page WHERE user_id = $1",
-            [req.user.id]
-        );
-        const isCreator = creatorResult.rowCount > 0;
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: "User not found" });
+        }
+
+        const row = result.rows[0];
 
         res.json({
             user: {
-                id: user.id,
-                name: user.name,
-                email: user.email,
-                bio: user.bio,
-                categories: user.categories,
-                profile_image: profileImage,
-                isCreator: isCreator,
-                role: user.role
+                id: row.id,
+                name: row.name,
+                email: row.email,
+                bio: row.creator_bio || row.bio || "",
+                categories: row.categories || [],
+                profile_image: row.creator_profile_image || row.user_profile_image || `https://placehold.co/400x400?text=${encodeURIComponent(row.name.charAt(0))}`,
+                profileImage: row.creator_profile_image || row.user_profile_image || `https://placehold.co/400x400?text=${encodeURIComponent(row.name.charAt(0))}`,
+                isCreator: !!row.is_creator || row.creator_profile_image !== null, // double safety
+                role: row.role,
+                socials: row.socials || {}
             }
         });
+
     } catch (error) {
         console.error("Verify error:", error);
         res.status(500).json({ error: "Server error", details: error.message });
