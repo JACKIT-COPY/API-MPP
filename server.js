@@ -2105,6 +2105,115 @@ app.get("/creator/:creatorName", async (req, res) => {
     }
 });
 
+// Simple in-memory cache for top creators (module-scoped)
+const topCreatorsCache = global.topCreatorsCache || new Map();
+global.topCreatorsCache = topCreatorsCache;
+
+// GET /top-creators — paginated, filterable, sortable, optional personalization
+app.get("/top-creators", async (req, res) => {
+    try {
+        const { category = "all", sort = "followers_desc", limit = "20", offset = "0", recommended } = req.query;
+        const parsedLimit = Math.min(parseInt(limit, 10) || 20, 100);
+        const parsedOffset = Math.max(parseInt(offset, 10) || 0, 0);
+        if (isNaN(parsedLimit) || parsedLimit < 1) return res.status(400).json({ error: "Invalid limit" });
+        if (isNaN(parsedOffset) || parsedOffset < 0) return res.status(400).json({ error: "Invalid offset" });
+
+        const allowedCategories = ["all", "sports", "gaming", "education", "finance", "cooking", "lifestyle"];
+        if (!allowedCategories.includes(category.toLowerCase())) return res.status(400).json({ error: "Invalid category" });
+
+        const allowedSort = ["followers_desc", "trending", "newest", "recommended"];
+        if (!allowedSort.includes(sort)) return res.status(400).json({ error: "Invalid sort" });
+
+        const recFlag = (recommended === "true" || recommended === true || recommended === "1");
+        const userId = req.user?.id;
+
+        if (recFlag && !userId) return res.status(401).json({ error: "Authentication required for recommended results" });
+
+        // Cache key includes authenticated user when applicable
+        const cacheKey = JSON.stringify({ category: category.toLowerCase(), sort, limit: parsedLimit, offset: parsedOffset, rec: !!recFlag, userId: userId || null });
+        const cached = topCreatorsCache.get(cacheKey);
+        if (cached && cached.expires > Date.now()) {
+            return res.json(cached.data);
+        }
+
+        // Build base query: select creators (users that have an entry in creators_page)
+        let baseQuery = `
+            SELECT
+                u.id,
+                u.name,
+                u.bio,
+                u.categories,
+                cp.profile_image,
+                cp.socials,
+                COALESCE(COUNT(DISTINCT s.user_id) FILTER (WHERE s.end_date > CURRENT_DATE AND s.payment_status = 'completed'), 0) AS follower_count,
+                COALESCE(SUM(p.views) FILTER (WHERE p.expires_at > NOW()), 0) AS total_views,
+                MAX(p.created_at) AS last_post_at
+            FROM users u
+            JOIN creators_page cp ON u.id = cp.user_id
+            LEFT JOIN subscriptions s ON s.creator_id = u.id
+            LEFT JOIN posts p ON p.user_id = u.id
+        `;
+
+        const whereClauses = [];
+        const params = [];
+
+        if (category.toLowerCase() !== 'all') {
+            params.push(category.toLowerCase());
+            whereClauses.push(`$${params.length} = ANY(u.categories)`);
+        }
+
+        // If personalized, prefer creators with overlapping categories
+        if (recFlag) {
+            const userRes = await pool.query('SELECT categories FROM users WHERE id = $1', [userId]);
+            const userCats = userRes.rows[0]?.categories || [];
+            if (Array.isArray(userCats) && userCats.length > 0) {
+                params.push(userCats);
+                whereClauses.push(`u.categories && $${params.length}::text[]`);
+            }
+        }
+
+        const groupBy = ` GROUP BY u.id, u.name, u.bio, u.categories, cp.profile_image, cp.socials`;
+
+        let orderClause = ' ORDER BY follower_count DESC';
+        if (sort === 'followers_desc') orderClause = ' ORDER BY follower_count DESC';
+        else if (sort === 'newest') orderClause = ' ORDER BY u.created_at DESC';
+        else if (sort === 'trending') orderClause = ' ORDER BY total_views DESC';
+        else if (sort === 'recommended') orderClause = ' ORDER BY follower_count DESC';
+
+        const whereSQL = whereClauses.length ? ' WHERE ' + whereClauses.join(' AND ') : '';
+
+        // Pagination params
+        params.push(parsedLimit, parsedOffset);
+        const pagination = ` LIMIT $${params.length - 1} OFFSET $${params.length}`;
+
+        const finalQuery = baseQuery + whereSQL + groupBy + orderClause + pagination;
+
+        const result = await pool.query(finalQuery, params);
+
+        const creators = result.rows.map(r => ({
+            id: r.id,
+            name: r.name,
+            bio: r.bio || '',
+            categories: r.categories || [],
+            profileImage: r.profile_image || 'https://placehold.co/200x200',
+            socials: r.socials || {},
+            followerCount: parseInt(r.follower_count) || 0,
+            totalViews: parseInt(r.total_views) || 0,
+            lastPostAt: r.last_post_at
+        }));
+
+        const response = { creators, pagination: { limit: parsedLimit, offset: parsedOffset, count: creators.length } };
+
+        // Cache results for short time (30s)
+        topCreatorsCache.set(cacheKey, { expires: Date.now() + 30 * 1000, data: response });
+
+        return res.json(response);
+    } catch (error) {
+        console.error('[top-creators] Error:', error);
+        return res.status(500).json({ error: 'Failed to fetch top creators', details: error.message });
+    }
+});
+
 // Get Subscription Tiers Endpoint
 app.get("/creators/:creatorId/subscription-tiers", authenticateToken, async (req, res) => {
     const { creatorId } = req.params;
