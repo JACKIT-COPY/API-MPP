@@ -1116,6 +1116,47 @@ app.post("/signup", async (req, res) => {
             ]
         );
 
+        // Assign default subscription tiers for new creators if they don't already have any
+        try {
+            const existingTiers = await pool.query(
+                `SELECT COUNT(*) FROM subscription_tiers WHERE creator_id = $1`,
+                [user.id]
+            );
+            if (parseInt(existingTiers.rows[0].count) === 0) {
+                const defaultTiers = [
+                    {
+                        name: "Monthly Membership",
+                        price: 140,
+                        interval: "month",
+                        description: "Access to exclusive posts and early content.",
+                        features: ["Exclusive posts", "Early access to content", "Direct messaging with creator"],
+                    },
+                    {
+                        name: "Daily Membership",
+                        price: 1,
+                        interval: "day",
+                        description: "Access to exclusive posts and early content.",
+                        features: ["Exclusive posts", "Early access to content", "Direct messaging with creator"],
+                    },
+                ];
+
+                for (const tier of defaultTiers) {
+                    await pool.query(
+                        `INSERT INTO subscription_tiers (creator_id, name, price, interval, description, features)
+                         VALUES ($1, $2, $3, $4, $5, $6)
+                         ON CONFLICT DO NOTHING`,
+                        [user.id, tier.name, tier.price, tier.interval, tier.description, JSON.stringify(tier.features)]
+                    );
+                }
+                console.log(`[signup] Assigned default Monthly and Daily tiers for creator userId=${user.id}`);
+            } else {
+                console.log(`[signup] Creator userId=${user.id} already has ${existingTiers.rows[0].count} subscription tier(s)`);
+            }
+        } catch (tierErr) {
+            console.error(`[signup] Failed to assign default subscription tiers for userId=${user.id}:`, tierErr);
+            throw tierErr;
+        }
+
         await pool.query("COMMIT");
 
         console.log(`New creator signed up: ${name} (${email}) → ID: ${user.id}`);
