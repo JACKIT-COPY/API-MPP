@@ -3081,7 +3081,7 @@ app.post("/api/mpesa/b2c_callback", async (req, res) => {
     }
 });
 
-// New endpoint: Update Payout Settingss
+// New endpoint: Update Payout Settings
 app.put("/creators/:creatorId/payout-settings", authenticateToken, async (req, res) => {
     const { creatorId } = req.params;
     const userId = req.user.id;
@@ -3139,6 +3139,58 @@ app.put("/creators/:creatorId/payout-settings", authenticateToken, async (req, r
     } catch (error) {
         console.error("Payout settings update error:", error);
         res.status(500).json({ error: "Failed to update payout settings", details: error.message });
+    }
+});
+
+// Get Payout Settings (public — hides sensitive fields unless requester is owner or admin)
+app.get("/creators/:creatorId/payout-settings", async (req, res) => {
+    const { creatorId } = req.params;
+    const authHeader = req.headers.authorization || "";
+    let requesterId = null;
+    let requesterRole = null;
+    if (authHeader.startsWith("Bearer ")) {
+        try {
+            const decoded = jwt.verify(authHeader.split("Bearer ")[1], secretKey);
+            requesterId = decoded.id;
+            requesterRole = decoded.role;
+        } catch (e) {
+            // ignore invalid token — treat as unauthenticated
+        }
+    }
+
+    try {
+        if (isNaN(creatorId)) return res.status(400).json({ error: "Invalid creator ID" });
+
+        // Verify creator exists
+        const creatorResult = await pool.query(
+            `SELECT u.id FROM users u JOIN creators_page cp ON u.id = cp.user_id WHERE u.id = $1`,
+            [creatorId]
+        );
+        if (creatorResult.rowCount === 0) return res.status(404).json({ error: "Creator not found" });
+
+        const result = await pool.query(
+            `SELECT payment_method, payout_threshold, email_notifications, mpesa_phone FROM payout_settings WHERE creator_id = $1`,
+            [creatorId]
+        );
+
+        const row = result.rows[0] || null;
+        const defaults = { payment_method: 'mpesa', payout_threshold: 50, email_notifications: true, mpesa_phone: null };
+        const settings = row ? {
+            payment_method: row.payment_method,
+            payout_threshold: row.payout_threshold,
+            email_notifications: row.email_notifications,
+            mpesa_phone: row.mpesa_phone
+        } : defaults;
+
+        // Hide sensitive phone unless requester is the owner or admin
+        if (!(parseInt(creatorId) === requesterId || requesterRole === 'admin')) {
+            settings.mpesa_phone = null;
+        }
+
+        res.json({ settings });
+    } catch (error) {
+        console.error("Payout settings fetch error:", error);
+        res.status(500).json({ error: "Failed to fetch payout settings", details: error.message });
     }
 });
 
