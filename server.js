@@ -1352,6 +1352,96 @@ app.put("/profile", authenticateToken, async (req, res) => {
   }
 });
 
+// PATCH /profile — Partial profile update (email NEVER updated here)
+app.patch("/profile", authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const { name, bio, categories, profile_image } = req.body;
+
+  try {
+    // Start transaction — update both users and creators_page safely
+    await pool.query("BEGIN");
+
+    // 1. Update users table (only safe fields — email is intentionally excluded)
+    const userUpdate = await pool.query(
+      `UPDATE users 
+       SET name = COALESCE($1, name),
+           bio = COALESCE($2, bio),
+           categories = COALESCE($3, categories)
+       WHERE id = $4
+       RETURNING id, name, email, bio, categories, role`,
+      [name || null, bio || null, categories || null, userId]
+    );
+
+    if (userUpdate.rowCount === 0) {
+      await pool.query("ROLLBACK");
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const updatedUser = userUpdate.rows[0];
+
+    // 2. Update or create creators_page (profile image + creator bio)
+    if (profile_image !== undefined || bio !== undefined) {
+      await pool.query(
+        `INSERT INTO creators_page (user_id, profile_image, bio, socials, updated_at)
+         VALUES ($1, $2, $3, $4, NOW())
+         ON CONFLICT (user_id) 
+         DO UPDATE SET 
+           profile_image = COALESCE(EXCLUDED.profile_image, creators_page.profile_image),
+           bio = COALESCE(EXCLUDED.bio, creators_page.bio),
+           socials = COALESCE(EXCLUDED.socials, creators_page.socials),
+           updated_at = NOW()`,
+        [userId, profile_image || null, bio || null, "{}"]
+      );
+    }
+
+    await pool.query("COMMIT");
+
+    // Return fresh user data
+    const verifyResult = await pool.query(
+      `SELECT 
+          u.name, u.email, u.bio, u.categories, u.role,
+          cp.profile_image,
+          cp.bio AS creator_bio,
+          cp.socials
+       FROM users u
+       LEFT JOIN creators_page cp ON u.id = cp.user_id
+       WHERE u.id = $1`,
+      [userId]
+    );
+
+    const row = verifyResult.rows[0];
+    const finalProfileImage = row.profile_image || 
+      `https://placehold.co/400x400?text=${encodeURIComponent(row.name.charAt(0))}`;
+
+    res.json({
+      message: "Profile updated successfully!",
+      user: {
+        id: userId,
+        name: row.name,
+        email: row.email,
+        bio: row.creator_bio || row.bio || "",
+        categories: row.categories || [],
+        profile_image: finalProfileImage,
+        profileImage: finalProfileImage,
+        isCreator: true,
+        role: row.role
+      }
+    });
+
+  } catch (error) {
+    await pool.query("ROLLBACK");
+    console.error("Profile update error:", error);
+    if (error.code === "23505") {
+      res.status(400).json({ error: "Email already in use (if changing email, use dedicated flow)" });
+    } else {
+      res.status(500).json({ 
+        error: "Failed to update profile", 
+        details: process.env.NODE_ENV === 'development' ? error.message : undefined 
+      });
+    }
+  }
+});
+
 // Creators Page Endpoint
 app.put("/creators-page", authenticateToken, uploadLimiter, async (req, res) => {
     const { profile, bio, socials } = req.body;
