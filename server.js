@@ -212,8 +212,7 @@ pool.query(`
             amount INTEGER,
             payment_method VARCHAR(50),
             mpesa_transaction_id VARCHAR(50),
-            payment_status VARCHAR(20) DEFAULT 'pending',
-
+            payment_status VARCHAR(20) DEFAULT 'pending'
         )
     `).then(() => console.log("Subscriptions table ready"))
       .catch(err => console.error("Error creating subscriptions table:", err));
@@ -504,22 +503,21 @@ pool.query(`
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
     )
-`).then(() => console.log("Promotions table ready"))
-  .catch(err => console.error("Error creating promotions table:", err));
-
-// Seed default promotions
-pool.query(`
-    INSERT INTO promotions (type, description, active, config) VALUES
-    ('first_week_flash', 'First-week flash sale: 20-30% extra credits on first purchase', false, '{"bonus_percent": 25}'),
-    ('weekend_boost', 'Double credits on Saturdays and Sundays', false, '{"multiplier": 2}'),
-    ('monthly_recharge', 'Buy 1000+ credits on 1st-5th of month → 15% extra', false, '{"bonus_percent": 15, "min_credits": 1000, "day_start": 1, "day_end": 5}'),
-    ('double_credits_week', 'Manual promotion: double credits for a week', false, '{"multiplier": 2}'),
-    ('referral_milestone', 'Refer 5 creators → 100 free credits', false, '{"required_referrals": 5, "bonus_credits": 100}'),
-    ('performance_bonus', 'Creators earning KSh 20000+/month → bonus credits', false, '{"min_earnings": 20000, "bonus_credits": 200}'),
-    ('top_referrer_perk', 'Monthly free credit allowance for top referrers', false, '{"bonus_credits": 500}')
-    ON CONFLICT (type) DO NOTHING
-`).then(() => console.log("Default promotions seeded"))
-  .catch(err => console.error("Error seeding promotions:", err));
+`).then(() => {
+    console.log("Promotions table ready");
+    return pool.query(`
+        INSERT INTO promotions (type, description, active, config) VALUES
+        ('first_week_flash', 'First-week flash sale: 20-30% extra credits on first purchase', false, '{"bonus_percent": 25}'),
+        ('weekend_boost', 'Double credits on Saturdays and Sundays', false, '{"multiplier": 2}'),
+        ('monthly_recharge', 'Buy 1000+ credits on 1st-5th of month → 15% extra', false, '{"bonus_percent": 15, "min_credits": 1000, "day_start": 1, "day_end": 5}'),
+        ('double_credits_week', 'Manual promotion: double credits for a week', false, '{"multiplier": 2}'),
+        ('referral_milestone', 'Refer 5 creators → 100 free credits', false, '{"required_referrals": 5, "bonus_credits": 100}'),
+        ('performance_bonus', 'Creators earning KSh 20000+/month → bonus credits', false, '{"min_earnings": 20000, "bonus_credits": 200}'),
+        ('top_referrer_perk', 'Monthly free credit allowance for top referrers', false, '{"bonus_credits": 500}')
+        ON CONFLICT (type) DO NOTHING
+    `);
+}).then(() => console.log("Default promotions seeded"))
+  .catch(err => console.error("Error creating or seeding promotions:", err));
 
 // Dormancy emails log (REQ-15)
 pool.query(`
