@@ -10,6 +10,7 @@ const { createClient } = require("@supabase/supabase-js");
 const rateLimit = require("express-rate-limit");
 const crypto = require('crypto');
 const { env } = require("process");
+const cron = require('node-cron');
 
 // At the top, add imports
 const { Server } = require('socket.io');
@@ -144,6 +145,12 @@ pool.connect((err) => {
         ADD COLUMN IF NOT EXISTS is_creator BOOLEAN DEFAULT FALSE
     `).then(() => console.log("Users table migration for is_creator complete"))
       .catch(err => console.error("Error migrating users table:", err));
+
+    pool.query(`
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS badges TEXT[] DEFAULT '{}'
+    `).then(() => console.log("Users table migration for badges complete"))
+      .catch(err => console.error("Error migrating users badges:", err));
       
 
     // Posts table with status column
@@ -416,6 +423,160 @@ pool.query(`
 .catch(err => {
     console.error("Error creating trigger/function:", err);
 });
+
+// ===== REQ-08 to REQ-17: New columns and tables =====
+
+// Add referral and credit columns to users table
+pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS referred_by INTEGER REFERENCES users(id),
+    ADD COLUMN IF NOT EXISTS referral_code VARCHAR(50) UNIQUE,
+    ADD COLUMN IF NOT EXISTS credits INTEGER DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS free_credits_remaining INTEGER DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS free_credits_expiry TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS free_credits_used_today INTEGER DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS free_credits_last_reset DATE,
+    ADD COLUMN IF NOT EXISTS is_active_creator BOOLEAN DEFAULT TRUE,
+    ADD COLUMN IF NOT EXISTS last_sale_at TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS active_until TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS onboarding_email_verified BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS onboarding_profile_photo BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS onboarding_first_post BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS badge_level INTEGER DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS badge_downgrade_start DATE,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+`).then(() => console.log("Users table referral/credit columns ready"))
+  .catch(err => console.error("Error adding referral/credit columns to users:", err));
+
+// Add boost columns to posts table
+pool.query(`
+    ALTER TABLE posts
+    ADD COLUMN IF NOT EXISTS boost_package VARCHAR(50),
+    ADD COLUMN IF NOT EXISTS boost_expires_at TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS boost_multiplier INTEGER DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS boost_impressions INTEGER DEFAULT 0
+`).then(() => console.log("Posts table boost columns ready"))
+  .catch(err => console.error("Error adding boost columns to posts:", err));
+
+// Revenue splits table (audit log for REQ-08)
+pool.query(`
+    CREATE TABLE IF NOT EXISTS revenue_splits (
+        id SERIAL PRIMARY KEY,
+        subscription_id INTEGER REFERENCES subscriptions(id),
+        transaction_id VARCHAR(50),
+        total_amount NUMERIC(10,2) NOT NULL,
+        creator_id INTEGER REFERENCES users(id),
+        creator_amount NUMERIC(10,2) NOT NULL,
+        referrer_id INTEGER REFERENCES users(id),
+        referrer_amount NUMERIC(10,2) DEFAULT 0,
+        platform_amount NUMERIC(10,2) DEFAULT 0,
+        referrer_tier VARCHAR(20),
+        referrer_active BOOLEAN DEFAULT FALSE,
+        active_referral_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+    )
+`).then(() => console.log("Revenue splits table ready"))
+  .catch(err => console.error("Error creating revenue_splits table:", err));
+
+// Credit transactions table (REQ-11)
+pool.query(`
+    CREATE TABLE IF NOT EXISTS credit_transactions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        amount INTEGER NOT NULL,
+        type VARCHAR(30) NOT NULL,
+        description TEXT,
+        package_name VARCHAR(50),
+        expires_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW()
+    )
+`).then(() => console.log("Credit transactions table ready"))
+  .catch(err => console.error("Error creating credit_transactions table:", err));
+
+// Promotions table (REQ-13)
+pool.query(`
+    CREATE TABLE IF NOT EXISTS promotions (
+        id SERIAL PRIMARY KEY,
+        type VARCHAR(50) NOT NULL UNIQUE,
+        description TEXT,
+        active BOOLEAN DEFAULT FALSE,
+        config JSONB DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    )
+`).then(() => console.log("Promotions table ready"))
+  .catch(err => console.error("Error creating promotions table:", err));
+
+// Seed default promotions
+pool.query(`
+    INSERT INTO promotions (type, description, active, config) VALUES
+    ('first_week_flash', 'First-week flash sale: 20-30% extra credits on first purchase', false, '{"bonus_percent": 25}'),
+    ('weekend_boost', 'Double credits on Saturdays and Sundays', false, '{"multiplier": 2}'),
+    ('monthly_recharge', 'Buy 1000+ credits on 1st-5th of month → 15% extra', false, '{"bonus_percent": 15, "min_credits": 1000, "day_start": 1, "day_end": 5}'),
+    ('double_credits_week', 'Manual promotion: double credits for a week', false, '{"multiplier": 2}'),
+    ('referral_milestone', 'Refer 5 creators → 100 free credits', false, '{"required_referrals": 5, "bonus_credits": 100}'),
+    ('performance_bonus', 'Creators earning KSh 20000+/month → bonus credits', false, '{"min_earnings": 20000, "bonus_credits": 200}'),
+    ('top_referrer_perk', 'Monthly free credit allowance for top referrers', false, '{"bonus_credits": 500}')
+    ON CONFLICT (type) DO NOTHING
+`).then(() => console.log("Default promotions seeded"))
+  .catch(err => console.error("Error seeding promotions:", err));
+
+// Dormancy emails log (REQ-15)
+pool.query(`
+    CREATE TABLE IF NOT EXISTS dormancy_emails (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        email_type VARCHAR(20) NOT NULL,
+        sent_at TIMESTAMP DEFAULT NOW()
+    )
+`).then(() => console.log("Dormancy emails table ready"))
+  .catch(err => console.error("Error creating dormancy_emails table:", err));
+
+// Retention cohorts (REQ-17)
+pool.query(`
+    CREATE TABLE IF NOT EXISTS retention_cohorts (
+        id SERIAL PRIMARY KEY,
+        cohort_month DATE NOT NULL,
+        total_registered INTEGER DEFAULT 0,
+        active_30d INTEGER DEFAULT 0,
+        active_60d INTEGER DEFAULT 0,
+        active_90d INTEGER DEFAULT 0,
+        active_180d INTEGER DEFAULT 0,
+        active_365d INTEGER DEFAULT 0,
+        calculated_at TIMESTAMP DEFAULT NOW()
+    )
+`).then(() => console.log("Retention cohorts table ready"))
+  .catch(err => console.error("Error creating retention_cohorts table:", err));
+
+// Update transactions type constraint to support new types
+pool.query(`
+    ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_type_check
+`).then(() => {
+    return pool.query(`
+        ALTER TABLE transactions ADD CONSTRAINT transactions_type_check
+        CHECK (type IN ('subscription', 'payout', 'referral_commission', 'credit_purchase', 'reactivation_fee', 'badge_reward'))
+    `);
+}).then(() => console.log("Transactions type constraint updated"))
+  .catch(err => console.error("Error updating transactions type constraint:", err));
+
+    // Followers table
+    pool.query(`
+        CREATE TABLE IF NOT EXISTS followers (
+            id SERIAL PRIMARY KEY,
+            follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(follower_id, following_id)
+        )
+    `).then(() => console.log("Followers table ready"))
+      .catch(err => console.error("Error creating followers table:", err));
+
+    pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_followers_follower ON followers(follower_id);
+        CREATE INDEX IF NOT EXISTS idx_followers_following ON followers(following_id);
+    `).then(() => console.log("Followers indexes ready"))
+      .catch(err => console.error("Error creating followers indexes:", err));
+
 });
 
 // Middleware to verify JWT
@@ -476,7 +637,7 @@ app.get("/moderation/posts", authenticateToken, async (req, res) => {
             SELECT 
                 p.id, p.user_id AS creator_id, p.type, p.title, p.caption, array_to_json(p.tags) AS tags,
                 p.images, p.video_url, p.audio_url, p.created_at, p.status, p.views,
-                p.duration, p.read_time, u.name AS creator_name, cp.profile_image AS creator_avatar,
+                p.duration, p.read_time, u.name AS creator_name, cp.profile_image AS creator_avatar, u.badge_level AS creator_badge_level,
                 COUNT(DISTINCT l.id) AS likes, COUNT(DISTINCT c.id) AS comments,
                 COUNT(DISTINCT r.id) AS report_count,
                 array_agg(DISTINCT r.reason) AS report_reasons
@@ -538,6 +699,7 @@ app.get("/moderation/posts", authenticateToken, async (req, res) => {
             status: post.status,
             creatorName: post.creator_name,
             creatorAvatar: post.creator_avatar || "https://placehold.co/40x40",
+            creatorBadgeLevel: post.creator_badge_level || 0,
             likes: parseInt(post.likes) || 0,
             comments: parseInt(post.comments) || 0,
             views: parseInt(post.views) || 0,
@@ -851,6 +1013,10 @@ app.post("/api/mpesa/callback", async (req, res) => {
             ]
         );
 
+        if (status === 'completed') {
+            await processRevenueSplit(subscriptionId, creatorId, amount, transactionId || CheckoutRequestID);
+        }
+
         await pool.query("COMMIT");
 
         res.sendStatus(200);
@@ -1050,7 +1216,7 @@ app.post("/subscribe", authenticateToken, async (req, res) => {
 
 // Signup
 app.post("/signup", async (req, res) => {
-    const { name, email, password, moderatorId, moderator, role } = req.body;
+    const { name, email, password, moderatorId, moderator, role, referralCode } = req.body;
 
     try {
         if (!name || !email || !password) {
@@ -1088,6 +1254,14 @@ app.post("/signup", async (req, res) => {
         );
         const userModerationId = `Md-${sequenceResult.rows[0].seq}`;
 
+        let referredBy = null;
+        if (referralCode) {
+            const refCheck = await pool.query(`SELECT id FROM users WHERE referral_code = $1`, [referralCode]);
+            if (refCheck.rowCount > 0) {
+                referredBy = refCheck.rows[0].id;
+            }
+        }
+
         // === START TRANSACTION: Create user + creator profile atomically ===
         await pool.query("BEGIN");
 
@@ -1095,10 +1269,10 @@ app.post("/signup", async (req, res) => {
         const userResult = await pool.query(
             `INSERT INTO users (
                 name, email, password, moderator_id, moderator, 
-                user_moderation_id, role, is_creator
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+                user_moderation_id, role, is_creator, referred_by
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8)
              RETURNING id, name, email, moderator_id, moderator, user_moderation_id, role`,
-            [name.trim(), email.toLowerCase(), hashedPassword, finalModeratorId, moderator || '', userModerationId, finalRole]
+            [name.trim(), email.toLowerCase(), hashedPassword, finalModeratorId, moderator || '', userModerationId, finalRole, referredBy]
         );
 
         const user = userResult.rows[0];
@@ -1219,6 +1393,7 @@ app.get("/verify", authenticateToken, async (req, res) => {
           u.categories,
           u.role,
           u.is_creator,
+          u.is_active_creator,
           cp.profile_image,
           cp.bio AS creator_bio,
           cp.socials
@@ -1740,9 +1915,9 @@ app.get("/explore", async (req, res) => {
             SELECT 
                 p.id, p.user_id AS creator_id, p.type, p.title, p.caption, array_to_json(p.tags) AS tags, 
                 p.images, p.video_url, p.audio_url, p.created_at, p.is_premium, p.visibility, 
-                p.read_time, p.duration, p.status, u.name AS creator_name, cp.profile_image AS creator_avatar,
+                p.read_time, p.duration, p.status, u.name AS creator_name, cp.profile_image AS creator_avatar, u.badge_level AS creator_badge_level,
                 COUNT(DISTINCT l.id) AS likes, COUNT(DISTINCT c.id) AS comments,
-                p.views
+                p.views, p.boost_multiplier, array_to_json(u.badges) AS creator_badges
             FROM posts p
             LEFT JOIN users u ON p.user_id = u.id
             LEFT JOIN creators_page cp ON p.user_id = cp.user_id
@@ -1765,22 +1940,22 @@ app.get("/explore", async (req, res) => {
         }
 
         query += `
-            GROUP BY p.id, p.user_id, u.name, cp.profile_image, p.views
+            GROUP BY p.id, p.user_id, u.name, cp.profile_image, p.views, p.boost_multiplier, u.badges, u.badge_level
         `;
 
         switch (sort) {
             case "newest":
-                query += " ORDER BY p.created_at DESC";
+                query += " ORDER BY p.boost_multiplier DESC, p.created_at DESC";
                 break;
             case "most_popular":
-                query += " ORDER BY (COUNT(l.id) + COUNT(c.id)) DESC, p.created_at DESC";
+                query += " ORDER BY p.boost_multiplier DESC, (COUNT(l.id) + COUNT(c.id)) DESC, p.created_at DESC";
                 break;
             case "recommended":
-                query += " ORDER BY RANDOM()";
+                query += " ORDER BY p.boost_multiplier DESC, RANDOM()";
                 break;
             case "trending":
             default:
-                query += " ORDER BY (COUNT(l.id) + COUNT(c.id)) DESC, p.created_at DESC";
+                query += " ORDER BY p.boost_multiplier DESC, (COUNT(l.id) + COUNT(c.id)) DESC, p.created_at DESC";
                 break;
         }
 
@@ -1803,12 +1978,15 @@ app.get("/explore", async (req, res) => {
             visibility: post.visibility,
             creatorName: post.creator_name,
             creatorAvatar: post.creator_avatar || "https://placehold.co/40x40",
+            creatorBadgeLevel: post.creator_badge_level || 0,
             likes: parseInt(post.likes) || 0,
             comments: parseInt(post.comments) || 0,
             views: parseInt(post.views) || 0,
             duration: post.duration,
             read_time: post.read_time,
-            isLiked: false // Default to false since user_id is not passed
+            isLiked: false, // Default to false since user_id is not passed
+            boost_multiplier: post.boost_multiplier,
+            creator_badges: post.creator_badges || []
         }));
 
         const totalQuery = `
@@ -1850,7 +2028,7 @@ app.get("/post/:id", async (req, res) => {
             `SELECT 
                 p.id, p.user_id AS creator_id, p.type, p.title, p.caption, array_to_json(p.tags) AS tags,
                 p.images, p.video_url, p.audio_url, p.created_at, p.is_premium, p.visibility,
-                p.read_time, p.duration, p.status, u.name AS creator_name, cp.profile_image AS creator_avatar,
+                p.read_time, p.duration, p.status, u.name AS creator_name, cp.profile_image AS creator_avatar, u.badge_level AS creator_badge_level,
                 COUNT(DISTINCT l.id) AS likes, COUNT(DISTINCT c.id) AS comments,
                 p.views
              FROM posts p
@@ -1884,6 +2062,7 @@ app.get("/post/:id", async (req, res) => {
             visibility: post.visibility,
             creatorName: post.creator_name,
             creatorAvatar: post.creator_avatar || "https://placehold.co/40x40",
+            creatorBadgeLevel: post.creator_badge_level || 0,
             likes: parseInt(post.likes) || 0,
             comments: parseInt(post.comments) || 0,
             views: parseInt(post.views) || 0,
@@ -2127,7 +2306,7 @@ app.get("/creator/:creatorName", async (req, res) => {
     try {
         const creatorResult = await pool.query(
             `SELECT 
-               u.id, u.name, u.bio, u.categories,
+               u.id, u.name, u.bio, u.categories, u.badge_level, u.is_active_creator,
                cp.profile_image, cp.socials
              FROM users u
              LEFT JOIN creators_page cp ON u.id = cp.user_id
@@ -2201,6 +2380,8 @@ app.get("/creator/:creatorName", async (req, res) => {
                 name: creator.name,
                 bio: creator.bio || "",
                 categories: creator.categories || [],
+                badge_level: creator.badge_level || 0,
+                is_active_creator: creator.is_active_creator,
                 profileImage: creator.profile_image || "https://placehold.co/200x200",
                 socials: creator.socials || {}
             },
@@ -2252,7 +2433,7 @@ app.get("/top-creators", async (req, res) => {
         const allowedCategories = ["all", "sports", "gaming", "education", "finance", "cooking", "lifestyle"];
         if (!allowedCategories.includes(category.toLowerCase())) return res.status(400).json({ error: "Invalid category" });
 
-        const allowedSort = ["followers_desc", "trending", "newest", "recommended"];
+        const allowedSort = ["followers_desc", "subscribers_desc", "trending", "newest", "recommended"];
         if (!allowedSort.includes(sort)) return res.status(400).json({ error: "Invalid sort" });
 
         const recFlag = (recommended === "true" || recommended === true || recommended === "1");
@@ -2306,7 +2487,7 @@ app.get("/top-creators", async (req, res) => {
         const groupBy = ` GROUP BY u.id, u.name, u.bio, u.categories, cp.profile_image, cp.socials`;
 
         let orderClause = ' ORDER BY follower_count DESC';
-        if (sort === 'followers_desc') orderClause = ' ORDER BY follower_count DESC';
+        if (sort === 'followers_desc' || sort === 'subscribers_desc') orderClause = ' ORDER BY follower_count DESC';
         else if (sort === 'newest') orderClause = ' ORDER BY u.created_at DESC';
         else if (sort === 'trending') orderClause = ' ORDER BY total_views DESC';
         else if (sort === 'recommended') orderClause = ' ORDER BY follower_count DESC';
@@ -2731,7 +2912,7 @@ app.get("/bookmarks", authenticateToken, async (req, res) => {
             SELECT 
                 p.id, p.user_id AS creator_id, p.type, p.title, p.caption, array_to_json(p.tags) AS tags,
                 p.images, p.video_url, p.audio_url, p.created_at, p.is_premium, p.visibility,
-                p.read_time, p.duration, u.name AS creator_name, cp.profile_image AS creator_avatar,
+                p.read_time, p.duration, u.name AS creator_name, cp.profile_image AS creator_avatar, u.badge_level AS creator_badge_level,
                 COUNT(DISTINCT l.id) AS likes, COUNT(DISTINCT c.id) AS comments,
                 p.views,
                 TRUE AS is_bookmarked,
@@ -2764,6 +2945,7 @@ app.get("/bookmarks", authenticateToken, async (req, res) => {
             visibility: post.visibility,
             creatorName: post.creator_name,
             creatorAvatar: post.creator_avatar || "https://placehold.co/40x40",
+            creatorBadgeLevel: post.creator_badge_level || 0,
             likes: parseInt(post.likes) || 0,
             comments: parseInt(post.comments) || 0,
             views: parseInt(post.views) || 0,
@@ -3343,6 +3525,1133 @@ app.get("/creators/:creatorId/transactions/export", authenticateToken, async (re
     }
 });
 
+// ===================================================================
+// REQ-08 to REQ-17: REFERRAL, CREDIT, BOOST, BADGE, RETENTION SYSTEM
+// ===================================================================
+
+// ---- Helper: Generate unique referral code ----
+function generateReferralCode(userId, name) {
+    const base = name.replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 6);
+    const hash = crypto.createHash('md5').update(`${userId}-${Date.now()}`).digest('hex').slice(0, 5);
+    return `${base}${hash}`;
+}
+
+// ---- Helper: Check if a creator is active (REQ-09) ----
+async function isCreatorActive(userId) {
+    const result = await pool.query(
+        `SELECT is_active_creator, last_sale_at, active_until, created_at FROM users WHERE id = $1`,
+        [userId]
+    );
+    if (result.rowCount === 0) return false;
+    const user = result.rows[0];
+    
+    // New users are active for first 30 days
+    if (user.created_at && (Date.now() - new Date(user.created_at).getTime()) < 30 * 24 * 60 * 60 * 1000) {
+        return true;
+    }
+    // Paid reactivation (active_until)
+    if (user.active_until && new Date(user.active_until) > new Date()) {
+        return true;
+    }
+    // Has made a sale in last 30 days
+    if (user.last_sale_at && (Date.now() - new Date(user.last_sale_at).getTime()) < 30 * 24 * 60 * 60 * 1000) {
+        return true;
+    }
+    return false;
+}
+
+// ---- Helper: Count active referrals for a referrer (REQ-08) ----
+async function countActiveReferrals(referrerId) {
+    const result = await pool.query(
+        `SELECT u.id, u.last_sale_at, u.active_until, u.created_at
+         FROM users u
+         WHERE u.referred_by = $1`,
+        [referrerId]
+    );
+    let activeCount = 0;
+    for (const ref of result.rows) {
+        // New users active for first 30 days
+        if (ref.created_at && (Date.now() - new Date(ref.created_at).getTime()) < 30 * 24 * 60 * 60 * 1000) {
+            // Check if they have made at least one sale
+            const saleCheck = await pool.query(
+                `SELECT 1 FROM transactions WHERE creator_id = $1 AND type = 'subscription' AND status = 'completed' LIMIT 1`,
+                [ref.id]
+            );
+            if (saleCheck.rowCount > 0) { activeCount++; continue; }
+        }
+        if (ref.active_until && new Date(ref.active_until) > new Date()) {
+            const saleCheck = await pool.query(
+                `SELECT 1 FROM transactions WHERE creator_id = $1 AND type = 'subscription' AND status = 'completed' LIMIT 1`,
+                [ref.id]
+            );
+            if (saleCheck.rowCount > 0) { activeCount++; continue; }
+        }
+        if (ref.last_sale_at && (Date.now() - new Date(ref.last_sale_at).getTime()) < 30 * 24 * 60 * 60 * 1000) {
+            activeCount++;
+        }
+    }
+    return activeCount;
+}
+
+// ---- Helper: Process revenue split on subscription payment (REQ-08) ----
+async function processRevenueSplit(subscriptionId, creatorId, totalAmount, transactionId) {
+    const creatorAmount = totalAmount * 0.85;
+    let referrerAmount = 0;
+    let platformAmount = totalAmount * 0.15;
+    let referrerId = null;
+    let referrerTier = 'none';
+    let referrerActive = false;
+    let activeReferralCount = 0;
+
+    // Find if creator was referred
+    const creatorResult = await pool.query(
+        `SELECT referred_by FROM users WHERE id = $1`, [creatorId]
+    );
+    referrerId = creatorResult.rows[0]?.referred_by || null;
+
+    if (referrerId) {
+        referrerActive = await isCreatorActive(referrerId);
+        if (referrerActive) {
+            activeReferralCount = await countActiveReferrals(referrerId);
+            if (activeReferralCount >= 11) {
+                referrerAmount = totalAmount * 0.15;
+                platformAmount = 0;
+                referrerTier = '15%';
+            } else {
+                referrerAmount = totalAmount * 0.12;
+                platformAmount = totalAmount * 0.03;
+                referrerTier = '12%';
+            }
+        } else {
+            // Dormant referrer — platform gets the referrer share
+            referrerAmount = 0;
+            platformAmount = totalAmount * 0.15;
+            referrerTier = 'dormant';
+        }
+    }
+
+    // Log the split
+    await pool.query(
+        `INSERT INTO revenue_splits 
+         (subscription_id, transaction_id, total_amount, creator_id, creator_amount, referrer_id, referrer_amount, platform_amount, referrer_tier, referrer_active, active_referral_count)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [subscriptionId, transactionId, totalAmount, creatorId, creatorAmount, referrerId, referrerAmount, platformAmount, referrerTier, referrerActive, activeReferralCount]
+    );
+
+    // Credit referrer's wallet if applicable
+    if (referrerId && referrerAmount > 0) {
+        await pool.query(
+            `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+             VALUES ($1, 'referral_commission', $2, 'completed', $3, $4)`,
+            [referrerId, referrerAmount, `RC-${transactionId}`, `Referral commission (${referrerTier}) from creator #${creatorId}`]
+        );
+    }
+
+    // Update creator's last_sale_at
+    await pool.query(
+        `UPDATE users SET last_sale_at = NOW(), is_active_creator = TRUE WHERE id = $1`,
+        [creatorId]
+    );
+
+    return { creatorAmount, referrerAmount, platformAmount, referrerTier };
+}
+
+// ---- Helper: Calculate badge level (REQ-14) ----
+function calculateBadgeLevel(activeSubscribers) {
+    if (activeSubscribers >= 1000) return 5;
+    if (activeSubscribers >= 200) return 4;
+    if (activeSubscribers >= 50) return 3;
+    if (activeSubscribers >= 20) return 2;
+    if (activeSubscribers >= 10) return 1;
+    return 0;
+}
+
+const BADGE_INFO = {
+    0: { name: 'None', color: '', credits: 0 },
+    1: { name: 'Sungura', color: 'bronze', credits: 150 },
+    2: { name: 'Mamba', color: 'silver', credits: 450 },
+    3: { name: 'Chui', color: 'gold', credits: 2500 },
+    4: { name: 'Simba', color: 'platinum', credits: 5000 },
+    5: { name: 'Nyota', color: 'diamond', credits: 7000 },
+};
+
+// ========== REQ-10: Referral Program Endpoints ==========
+
+// Generate referral code
+app.post("/api/referrals/generate", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        
+        // Check if already has a code
+        const existing = await pool.query(
+            `SELECT referral_code FROM users WHERE id = $1`, [userId]
+        );
+        if (existing.rows[0]?.referral_code) {
+            return res.json({ referralCode: existing.rows[0].referral_code, link: `${process.env.FRONTEND_URL || 'https://mypaidpost.com'}/ref/${existing.rows[0].referral_code}` });
+        }
+        
+        const user = await pool.query(`SELECT name FROM users WHERE id = $1`, [userId]);
+        const code = generateReferralCode(userId, user.rows[0].name);
+        
+        await pool.query(
+            `UPDATE users SET referral_code = $1 WHERE id = $2`,
+            [code, userId]
+        );
+        
+        res.json({ referralCode: code, link: `${process.env.FRONTEND_URL || 'https://mypaidpost.com'}/ref/${code}` });
+    } catch (error) {
+        console.error("Referral code generation error:", error);
+        res.status(500).json({ error: "Failed to generate referral code" });
+    }
+});
+
+// Get referral stats
+app.get("/api/referrals/stats", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        
+        // Get referral code
+        const userResult = await pool.query(
+            `SELECT referral_code, is_active_creator FROM users WHERE id = $1`, [userId]
+        );
+        
+        // Count total referrals
+        const totalReferrals = await pool.query(
+            `SELECT COUNT(*) as count FROM users WHERE referred_by = $1`, [userId]
+        );
+        
+        // Count active referrals
+        const activeCount = await countActiveReferrals(userId);
+        
+        // Total commission earned
+        const commissions = await pool.query(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions 
+             WHERE creator_id = $1 AND type = 'referral_commission' AND status = 'completed'`,
+            [userId]
+        );
+        
+        // This month's commission
+        const monthlyCommissions = await pool.query(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions 
+             WHERE creator_id = $1 AND type = 'referral_commission' AND status = 'completed'
+             AND created_at >= date_trunc('month', NOW())`,
+            [userId]
+        );
+        
+        // Commission tier
+        const tier = activeCount >= 11 ? '15%' : '12%';
+        
+        res.json({
+            referralCode: userResult.rows[0]?.referral_code || null,
+            referralLink: userResult.rows[0]?.referral_code 
+                ? `${process.env.FRONTEND_URL || 'https://mypaidpost.com'}/ref/${userResult.rows[0].referral_code}` 
+                : null,
+            isActive: userResult.rows[0]?.is_active_creator || false,
+            totalReferrals: parseInt(totalReferrals.rows[0].count),
+            activeReferrals: activeCount,
+            currentTier: tier,
+            totalCommissionEarned: parseFloat(commissions.rows[0].total),
+            monthlyCommission: parseFloat(monthlyCommissions.rows[0].total)
+        });
+    } catch (error) {
+        console.error("Referral stats error:", error);
+        res.status(500).json({ error: "Failed to fetch referral stats" });
+    }
+});
+
+// Public referral page data (no auth needed)
+app.get("/api/referrals/info", async (req, res) => {
+    res.json({
+        tiers: [
+            { minReferrals: 1, maxReferrals: 10, commission: '12%', platformFee: '3%' },
+            { minReferrals: 11, maxReferrals: null, commission: '15%', platformFee: '0%' }
+        ],
+        earningsExamples: [
+            { activeReferrals: 5, avgMonthly: 25000, yourCommission: 15000 },
+            { activeReferrals: 10, avgMonthly: 30000, yourCommission: 45000 },
+            { activeReferrals: 25, avgMonthly: 35000, yourCommission: 131250 }
+        ],
+        faqs: [
+            { q: "How long do I earn commissions?", a: "Lifetime, as long as referred creator is active" },
+            { q: "When do I get paid?", a: "Instantly into your MyPaidPost wallet; withdraw anytime" },
+            { q: "What counts as an active referral?", a: "At least one sale from their content in the last 30 days" },
+            { q: "Can I refer myself?", a: "No" },
+            { q: "Minimum withdrawal?", a: "KSh 500" },
+            { q: "Withdrawal charges?", a: "None from MyPaidPost; standard M-Pesa charges apply" }
+        ]
+    });
+});
+
+// ========== REQ-11: Credit System Endpoints ==========
+
+const CREDIT_PACKAGES = [
+    { id: 'starter', name: 'Starter', credits: 100, price: 249 },
+    { id: 'value', name: 'Value', credits: 500, price: 999 },
+    { id: 'growth', name: 'Growth', credits: 1200, price: 2199 },
+    { id: 'pro', name: 'Pro', credits: 3000, price: 4999 }
+];
+
+// Get credit balance and packages
+app.get("/api/credits", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const user = await pool.query(
+            `SELECT credits, free_credits_remaining, free_credits_expiry, free_credits_used_today, 
+                    onboarding_email_verified, onboarding_profile_photo, onboarding_first_post
+             FROM users WHERE id = $1`, [userId]
+        );
+        
+        if (user.rowCount === 0) return res.status(404).json({ error: "User not found" });
+        
+        const u = user.rows[0];
+        const freeCreditsActive = u.free_credits_expiry && new Date(u.free_credits_expiry) > new Date();
+        const onboardingComplete = u.onboarding_email_verified && u.onboarding_profile_photo && u.onboarding_first_post;
+        
+        // Recent credit transactions
+        const history = await pool.query(
+            `SELECT amount, type, description, created_at FROM credit_transactions
+             WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`, [userId]
+        );
+        
+        res.json({
+            credits: u.credits,
+            freeCreditsRemaining: freeCreditsActive ? u.free_credits_remaining : 0,
+            freeCreditsExpiry: freeCreditsActive ? u.free_credits_expiry : null,
+            freeCreditsUsedToday: u.free_credits_used_today,
+            dailyFreeCreditCap: 150,
+            onboarding: {
+                emailVerified: u.onboarding_email_verified,
+                profilePhoto: u.onboarding_profile_photo,
+                firstPost: u.onboarding_first_post,
+                complete: onboardingComplete
+            },
+            packages: CREDIT_PACKAGES,
+            history: history.rows
+        });
+    } catch (error) {
+        console.error("Credits fetch error:", error);
+        res.status(500).json({ error: "Failed to fetch credits" });
+    }
+});
+
+// Purchase credits (initiates M-Pesa STK push)
+app.post("/api/credits/purchase", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { packageId, phoneNumber } = req.body;
+        
+        const pkg = CREDIT_PACKAGES.find(p => p.id === packageId);
+        if (!pkg) return res.status(400).json({ error: "Invalid package" });
+        if (!phoneNumber || !/^254\d{9}$/.test(phoneNumber)) {
+            return res.status(400).json({ error: "Invalid phone number" });
+        }
+        
+        // Check for active promotions and calculate bonus
+        let bonusCredits = 0;
+        let bonusReason = '';
+        
+        // Weekend boost
+        const day = new Date().getDay();
+        const weekendPromo = await pool.query(`SELECT active, config FROM promotions WHERE type = 'weekend_boost'`);
+        if (weekendPromo.rows[0]?.active && (day === 0 || day === 6)) {
+            bonusCredits = pkg.credits; // double
+            bonusReason = 'Weekend Boost: Double Credits';
+        }
+        
+        // First-week flash sale
+        const user = await pool.query(`SELECT created_at FROM users WHERE id = $1`, [userId]);
+        const daysSinceSignup = (Date.now() - new Date(user.rows[0].created_at).getTime()) / (1000 * 60 * 60 * 24);
+        if (daysSinceSignup <= 7) {
+            const flashPromo = await pool.query(`SELECT active, config FROM promotions WHERE type = 'first_week_flash'`);
+            if (flashPromo.rows[0]?.active) {
+                const firstPurchase = await pool.query(
+                    `SELECT 1 FROM credit_transactions WHERE user_id = $1 AND type = 'purchase' LIMIT 1`, [userId]
+                );
+                if (firstPurchase.rowCount === 0) {
+                    const bonus = Math.floor(pkg.credits * (flashPromo.rows[0].config.bonus_percent / 100));
+                    if (bonus > bonusCredits) {
+                        bonusCredits = bonus;
+                        bonusReason = 'First-Week Flash Sale';
+                    }
+                }
+            }
+        }
+        
+        // Monthly recharge
+        const dayOfMonth = new Date().getDate();
+        const monthlyPromo = await pool.query(`SELECT active, config FROM promotions WHERE type = 'monthly_recharge'`);
+        if (monthlyPromo.rows[0]?.active && pkg.credits >= 1000 && dayOfMonth >= 1 && dayOfMonth <= 5) {
+            const bonus = Math.floor(pkg.credits * 0.15);
+            if (bonus > bonusCredits) {
+                bonusCredits = bonus;
+                bonusReason = 'Monthly Recharge Bonus';
+            }
+        }
+        
+        // Initiate M-Pesa STK Push
+        const token = await getAccessToken();
+        const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
+        const password = Buffer.from(`${process.env.PAYBILL_NUMBER}${process.env.PASSKEY}${timestamp}`).toString('base64');
+        
+        const stkResponse = await axios.post(
+            process.env.MPESA_ENV === 'production'
+                ? 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest'
+                : 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+            {
+                BusinessShortCode: process.env.PAYBILL_NUMBER,
+                Password: password,
+                Timestamp: timestamp,
+                TransactionType: 'CustomerPayBillOnline',
+                Amount: pkg.price,
+                PartyA: phoneNumber,
+                PartyB: process.env.PAYBILL_NUMBER,
+                PhoneNumber: phoneNumber,
+                CallBackURL: `${process.env.MPESA_CALLBACK_URL}_credits`,
+                AccountReference: `MPP_Credits_${userId}_${packageId}`,
+                TransactionDesc: `MyPaidPost Credit Purchase: ${pkg.name}`
+            },
+            { headers: { Authorization: `Bearer ${token}` } }
+        );
+        
+        // Store pending transaction
+        await pool.query(
+            `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+             VALUES ($1, 'credit_purchase', $2, 'pending', $3, $4)`,
+            [userId, pkg.price, stkResponse.data.CheckoutRequestID, `${pkg.name} (${pkg.credits} credits${bonusCredits > 0 ? ` + ${bonusCredits} bonus` : ''})` ]
+        );
+        
+        res.json({
+            success: true,
+            checkoutRequestId: stkResponse.data.CheckoutRequestID,
+            package: pkg,
+            bonusCredits,
+            bonusReason,
+            totalCredits: pkg.credits + bonusCredits
+        });
+    } catch (error) {
+        console.error("Credit purchase error:", error);
+        res.status(500).json({ error: "Failed to initiate credit purchase" });
+    }
+});
+
+// Credit purchase callback (M-Pesa)
+app.post("/api/mpesa/callback_credits", async (req, res) => {
+    try {
+        const stkCallback = req.body.Body?.stkCallback;
+        if (!stkCallback) return res.status(400).json({ error: "Invalid callback" });
+        
+        const { ResultCode, CheckoutRequestID } = stkCallback;
+        const transactionMpesaId = stkCallback.CallbackMetadata?.Item?.find(i => i.Name === 'MpesaReceiptNumber')?.Value;
+        
+        const transResult = await pool.query(
+            `SELECT id, creator_id, description FROM transactions WHERE transaction_id = $1 AND type = 'credit_purchase' AND status = 'pending'`,
+            [CheckoutRequestID]
+        );
+        if (transResult.rowCount === 0) return res.status(404).json({ error: "Transaction not found" });
+        
+        const trans = transResult.rows[0];
+        const status = ResultCode === 0 ? 'completed' : 'failed';
+        
+        await pool.query(
+            `UPDATE transactions SET status = $1, transaction_id = $2 WHERE id = $3`,
+            [status, transactionMpesaId || CheckoutRequestID, trans.id]
+        );
+        
+        if (status === 'completed') {
+            // Parse credits from description
+            const match = trans.description.match(/(\d+) credits/);
+            const bonusMatch = trans.description.match(/\+ (\d+) bonus/);
+            const baseCredits = match ? parseInt(match[1]) : 0;
+            const bonusCredits = bonusMatch ? parseInt(bonusMatch[1]) : 0;
+            const totalCredits = baseCredits + bonusCredits;
+            
+            // Add credits to user
+            await pool.query(
+                `UPDATE users SET credits = credits + $1 WHERE id = $2`,
+                [totalCredits, trans.creator_id]
+            );
+            
+            // Log credit transaction
+            await pool.query(
+                `INSERT INTO credit_transactions (user_id, amount, type, description, expires_at)
+                 VALUES ($1, $2, 'purchase', $3, NOW() + INTERVAL '90 days')`,
+                [trans.creator_id, totalCredits, `Purchased ${baseCredits} credits${bonusCredits > 0 ? ` + ${bonusCredits} bonus` : ''}`]
+            );
+        }
+        
+        res.sendStatus(200);
+    } catch (error) {
+        console.error("Credit callback error:", error);
+        res.status(500).json({ error: "Failed to process callback" });
+    }
+});
+
+// ========== REQ-12: Post Boosting Endpoints ==========
+
+const BOOST_PACKAGES = [
+    { id: 'mini', name: 'Mini Boost', credits: 30, duration_hours: 24, multiplier: 3, impressions: '800–2,000', bestFor: 'Quick tests' },
+    { id: 'standard', name: 'Standard Boost', credits: 80, duration_hours: 72, multiplier: 6, impressions: '2,500–6,000', bestFor: 'Best value' },
+    { id: 'power', name: 'Power Boost', credits: 200, duration_hours: 168, multiplier: 12, impressions: '8,000–18,000', bestFor: 'Strong growth' },
+    { id: 'premium', name: 'Premium Boost', credits: 500, duration_hours: 168, multiplier: 25, impressions: '25,000–55,000', bestFor: 'Major launches' }
+];
+
+// Get boost packages
+app.get("/api/boost/packages", (req, res) => {
+    res.json({ packages: BOOST_PACKAGES });
+});
+
+// Boost a post
+app.post("/api/posts/:postId/boost", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const postId = parseInt(req.params.postId);
+        const { packageId } = req.body;
+        
+        if (isNaN(postId)) return res.status(400).json({ error: "Invalid post ID" });
+        
+        const pkg = BOOST_PACKAGES.find(p => p.id === packageId);
+        if (!pkg) return res.status(400).json({ error: "Invalid boost package" });
+        
+        // Check post ownership
+        const post = await pool.query(
+            `SELECT id, user_id, boost_expires_at FROM posts WHERE id = $1 AND user_id = $2`,
+            [postId, userId]
+        );
+        if (post.rowCount === 0) return res.status(404).json({ error: "Post not found or not yours" });
+        
+        // Check if already boosted
+        if (post.rows[0].boost_expires_at && new Date(post.rows[0].boost_expires_at) > new Date()) {
+            return res.status(400).json({ error: "Post is already boosted. Wait for the current boost to expire." });
+        }
+        
+        // Check quality requirements
+        const postData = await pool.query(
+            `SELECT type, caption, duration FROM posts WHERE id = $1`, [postId]
+        );
+        const p = postData.rows[0];
+        if (p.type === 'article' && (!p.caption || p.caption.length < 800)) {
+            return res.status(400).json({ error: "Written posts must be at least 800 characters to boost" });
+        }
+        // Video duration check would go here if we parse duration properly
+        
+        // Check credit balance (free credits first, then purchased)
+        const user = await pool.query(
+            `SELECT credits, free_credits_remaining, free_credits_expiry, free_credits_used_today FROM users WHERE id = $1`,
+            [userId]
+        );
+        const u = user.rows[0];
+        const freeCreditsActive = u.free_credits_expiry && new Date(u.free_credits_expiry) > new Date();
+        let freeToUse = 0;
+        let paidToUse = 0;
+        
+        if (freeCreditsActive && u.free_credits_remaining > 0) {
+            const availableFreeToday = Math.max(0, 150 - u.free_credits_used_today);
+            freeToUse = Math.min(pkg.credits, u.free_credits_remaining, availableFreeToday);
+        }
+        paidToUse = pkg.credits - freeToUse;
+        
+        if (paidToUse > u.credits) {
+            return res.status(400).json({ error: `Insufficient credits. You need ${pkg.credits} credits but have ${u.credits + (freeCreditsActive ? u.free_credits_remaining : 0)} total.` });
+        }
+        
+        // Deduct credits
+        await pool.query("BEGIN");
+        
+        if (freeToUse > 0) {
+            await pool.query(
+                `UPDATE users SET free_credits_remaining = free_credits_remaining - $1, free_credits_used_today = free_credits_used_today + $1 WHERE id = $2`,
+                [freeToUse, userId]
+            );
+        }
+        if (paidToUse > 0) {
+            await pool.query(
+                `UPDATE users SET credits = credits - $1 WHERE id = $2`,
+                [paidToUse, userId]
+            );
+        }
+        
+        // Activate boost
+        const boostExpiry = new Date(Date.now() + pkg.duration_hours * 60 * 60 * 1000);
+        await pool.query(
+            `UPDATE posts SET boost_package = $1, boost_expires_at = $2, boost_multiplier = $3, boost_impressions = 0 WHERE id = $4`,
+            [pkg.name, boostExpiry.toISOString(), pkg.multiplier, postId]
+        );
+        
+        // Log credit transaction
+        await pool.query(
+            `INSERT INTO credit_transactions (user_id, amount, type, description)
+             VALUES ($1, $2, 'boost', $3)`,
+            [userId, -pkg.credits, `${pkg.name} on post #${postId}`]
+        );
+        
+        await pool.query("COMMIT");
+        
+        res.json({
+            message: "Post boosted successfully!",
+            boost: {
+                package: pkg.name,
+                expiresAt: boostExpiry,
+                multiplier: pkg.multiplier,
+                creditsUsed: pkg.credits
+            }
+        });
+    } catch (error) {
+        await pool.query("ROLLBACK");
+        console.error("Boost error:", error);
+        res.status(500).json({ error: "Failed to boost post" });
+    }
+});
+
+// Get boost analytics for a post
+app.get("/api/posts/:postId/boost-stats", authenticateToken, async (req, res) => {
+    try {
+        const postId = parseInt(req.params.postId);
+        const userId = req.user.id;
+        
+        const result = await pool.query(
+            `SELECT boost_package, boost_expires_at, boost_multiplier, boost_impressions, views
+             FROM posts WHERE id = $1 AND user_id = $2`,
+            [postId, userId]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: "Post not found" });
+        
+        const post = result.rows[0];
+        const isActive = post.boost_expires_at && new Date(post.boost_expires_at) > new Date();
+        
+        res.json({
+            boostActive: isActive,
+            package: post.boost_package,
+            expiresAt: post.boost_expires_at,
+            multiplier: post.boost_multiplier,
+            impressions: post.boost_impressions || 0,
+            views: post.views || 0
+        });
+    } catch (error) {
+        console.error("Boost stats error:", error);
+        res.status(500).json({ error: "Failed to fetch boost stats" });
+    }
+});
+
+// ========== REQ-14: Badge System Endpoints ==========
+
+// Get badge info for a creator
+app.get("/api/creators/:creatorId/badge", async (req, res) => {
+    try {
+        const creatorId = parseInt(req.params.creatorId);
+        if (isNaN(creatorId)) return res.status(400).json({ error: "Invalid creator ID" });
+        
+        // Count active paying subscribers
+        const subResult = await pool.query(
+            `SELECT COUNT(*) as count FROM subscriptions
+             WHERE creator_id = $1 AND end_date > CURRENT_DATE AND payment_status = 'completed'`,
+            [creatorId]
+        );
+        const subscriberCount = parseInt(subResult.rows[0].count);
+        const level = calculateBadgeLevel(subscriberCount);
+        const badge = BADGE_INFO[level];
+        
+        // Get stored badge level for grace period check
+        const userResult = await pool.query(
+            `SELECT badge_level, badge_downgrade_start FROM users WHERE id = $1`, [creatorId]
+        );
+        const storedLevel = userResult.rows[0]?.badge_level || 0;
+        
+        // Use the higher of stored or calculated level (grace period)
+        const effectiveLevel = Math.max(level, storedLevel);
+        const effectiveBadge = BADGE_INFO[effectiveLevel];
+        
+        res.json({
+            subscriberCount,
+            calculatedLevel: level,
+            effectiveLevel,
+            badge: {
+                name: effectiveBadge.name,
+                color: effectiveBadge.color,
+                monthlyCredits: effectiveBadge.credits
+            },
+            allBadges: Object.entries(BADGE_INFO).filter(([k]) => k !== '0').map(([k, v]) => ({
+                level: parseInt(k),
+                ...v,
+                subscribers: k === '1' ? '10-19' : k === '2' ? '20-49' : k === '3' ? '50-199' : k === '4' ? '200-999' : '1,000+',
+                current: parseInt(k) === effectiveLevel
+            }))
+        });
+    } catch (error) {
+        console.error("Badge fetch error:", error);
+        res.status(500).json({ error: "Failed to fetch badge info" });
+    }
+});
+
+// ========== REQ-16: Reactivation Endpoints ==========
+
+// Check dormancy status
+app.get("/api/account/status", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const user = await pool.query(
+            `SELECT is_active_creator, last_sale_at, active_until, created_at, referred_by FROM users WHERE id = $1`,
+            [userId]
+        );
+        if (user.rowCount === 0) return res.status(404).json({ error: "User not found" });
+        
+        const u = user.rows[0];
+        const isActive = await isCreatorActive(userId);
+        
+        let daysSinceLastSale = null;
+        if (u.last_sale_at) {
+            daysSinceLastSale = Math.floor((Date.now() - new Date(u.last_sale_at).getTime()) / (1000 * 60 * 60 * 24));
+        }
+        
+        // Calculate potential commission loss
+        let potentialLoss = 0;
+        if (u.referred_by) {
+            const recentCommissions = await pool.query(
+                `SELECT COALESCE(SUM(referrer_amount), 0) as total FROM revenue_splits 
+                 WHERE referrer_id = $1 AND created_at >= NOW() - INTERVAL '30 days'`,
+                [userId]
+            );
+            potentialLoss = parseFloat(recentCommissions.rows[0].total);
+        }
+        
+        // Check referral earnings this user generates for THEIR referrer
+        const totalReferralEarnings = await pool.query(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM transactions 
+             WHERE creator_id = $1 AND type = 'referral_commission' AND status = 'completed'`,
+            [userId]
+        );
+        
+        res.json({
+            isActive,
+            isDormant: !isActive,
+            lastSaleAt: u.last_sale_at,
+            daysSinceLastSale,
+            activeUntil: u.active_until,
+            daysUntilDormant: daysSinceLastSale !== null ? Math.max(0, 30 - daysSinceLastSale) : null,
+            reactivationOptions: !isActive ? [
+                { method: 'sale', description: 'Make at least one sale on your own content' },
+                { method: 'subscribe', description: 'Subscribe to at least one other creator' },
+                { method: 'fee', description: 'Pay KSh 199 reactivation fee (active for 60 days)', price: 199 }
+            ] : null,
+            potentialCommissionLoss: potentialLoss,
+            totalReferralEarnings: parseFloat(totalReferralEarnings.rows[0].total)
+        });
+    } catch (error) {
+        console.error("Account status error:", error);
+        res.status(500).json({ error: "Failed to fetch account status" });
+    }
+});
+
+// Reactivate via KSh 199 fee (REQ-16)
+app.post("/api/account/reactivate", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { phoneNumber, paymentMethod } = req.body;
+        
+        // Check if already active
+        const isActive = await isCreatorActive(userId);
+        if (isActive) {
+            return res.status(400).json({ error: "Your account is already active" });
+        }
+        
+        if (paymentMethod === 'wallet') {
+            // Check wallet balance
+            const balanceQuery = `
+                SELECT COALESCE(SUM(CASE WHEN type = 'subscription' AND status = 'completed' THEN amount 
+                                          WHEN type = 'referral_commission' AND status = 'completed' THEN amount
+                                          WHEN type = 'payout' AND status = 'completed' THEN amount
+                                          ELSE 0 END), 0) AS balance
+                FROM transactions WHERE creator_id = $1
+            `;
+            const balance = await pool.query(balanceQuery, [userId]);
+            if (parseFloat(balance.rows[0].balance) < 199) {
+                return res.status(400).json({ error: "Insufficient wallet balance" });
+            }
+            
+            // Deduct from wallet
+            await pool.query(
+                `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+                 VALUES ($1, 'reactivation_fee', -199, 'completed', $2, 'Account reactivation fee - 60 days active')`,
+                [userId, `REACT-${Date.now()}`]
+            );
+            
+            // Set active for 60 days
+            const activeUntil = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
+            await pool.query(
+                `UPDATE users SET is_active_creator = TRUE, active_until = $1 WHERE id = $2`,
+                [activeUntil, userId]
+            );
+            
+            return res.json({ message: "Account reactivated!", activeUntil });
+        }
+        
+        // M-Pesa payment
+        if (!phoneNumber || !/^254\d{9}$/.test(phoneNumber)) {
+            return res.status(400).json({ error: "Invalid phone number" });
+        }
+        
+        const token = await getAccessToken();
+        const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
+        const password = Buffer.from(`${process.env.PAYBILL_NUMBER}${process.env.PASSKEY}${timestamp}`).toString('base64');
+        
+        const stkResponse = await axios.post(
+            process.env.MPESA_ENV === 'production'
+                ? 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest'
+                : 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+            {
+                BusinessShortCode: process.env.PAYBILL_NUMBER,
+                Password: password,
+                Timestamp: timestamp,
+                TransactionType: 'CustomerPayBillOnline',
+                Amount: 199,
+                PartyA: phoneNumber,
+                PartyB: process.env.PAYBILL_NUMBER,
+                PhoneNumber: phoneNumber,
+                CallBackURL: `${process.env.MPESA_CALLBACK_URL}_reactivation`,
+                AccountReference: `MPP_Reactivation_${userId}`,
+                TransactionDesc: 'MyPaidPost Account Reactivation'
+            },
+            { headers: { Authorization: `Bearer ${token}` } }
+        );
+        
+        await pool.query(
+            `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+             VALUES ($1, 'reactivation_fee', 199, 'pending', $2, 'Account reactivation fee - 60 days active')`,
+            [userId, stkResponse.data.CheckoutRequestID]
+        );
+        
+        res.json({ success: true, checkoutRequestId: stkResponse.data.CheckoutRequestID });
+    } catch (error) {
+        console.error("Reactivation error:", error);
+        res.status(500).json({ error: "Failed to initiate reactivation" });
+    }
+});
+
+// Reactivation M-Pesa callback
+app.post("/api/mpesa/callback_reactivation", async (req, res) => {
+    try {
+        const stkCallback = req.body.Body?.stkCallback;
+        if (!stkCallback) return res.status(400).json({ error: "Invalid callback" });
+        
+        const { ResultCode, CheckoutRequestID } = stkCallback;
+        const transResult = await pool.query(
+            `SELECT id, creator_id FROM transactions WHERE transaction_id = $1 AND type = 'reactivation_fee' AND status = 'pending'`,
+            [CheckoutRequestID]
+        );
+        if (transResult.rowCount === 0) return res.status(404).json({ error: "Transaction not found" });
+        
+        const status = ResultCode === 0 ? 'completed' : 'failed';
+        await pool.query(`UPDATE transactions SET status = $1 WHERE id = $2`, [status, transResult.rows[0].id]);
+        
+        if (status === 'completed') {
+            const activeUntil = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
+            await pool.query(
+                `UPDATE users SET is_active_creator = TRUE, active_until = $1 WHERE id = $2`,
+                [activeUntil, transResult.rows[0].creator_id]
+            );
+        }
+        
+        res.sendStatus(200);
+    } catch (error) {
+        console.error("Reactivation callback error:", error);
+        res.status(500).json({ error: "Failed to process callback" });
+    }
+});
+
+// ========== REQ-17: Admin Retention Metrics ==========
+
+app.get("/api/admin/retention", authenticateToken, async (req, res) => {
+    try {
+        // Verify admin
+        const userResult = await pool.query(
+            `SELECT role FROM users WHERE id = $1`, [req.user.id]
+        );
+        if (userResult.rows[0]?.role !== 'admin') {
+            return res.status(403).json({ error: "Admin access required" });
+        }
+        
+        // Overall stats
+        const totalCreators = await pool.query(`SELECT COUNT(*) as count FROM users WHERE is_creator = TRUE`);
+        const activeCreators = await pool.query(
+            `SELECT COUNT(*) as count FROM users WHERE is_creator = TRUE AND is_active_creator = TRUE`
+        );
+        
+        // Cohort retention
+        const cohorts = await pool.query(`
+            SELECT 
+                date_trunc('month', created_at) as cohort_month,
+                COUNT(*) as total_registered,
+                COUNT(*) FILTER (WHERE last_sale_at >= NOW() - INTERVAL '30 days' OR active_until > NOW() OR created_at >= NOW() - INTERVAL '30 days') as active_now,
+                COUNT(*) FILTER (WHERE last_sale_at >= created_at + INTERVAL '30 days' OR active_until > created_at + INTERVAL '30 days') as retained_30d,
+                COUNT(*) FILTER (WHERE last_sale_at >= created_at + INTERVAL '90 days' OR active_until > created_at + INTERVAL '90 days') as retained_90d
+            FROM users
+            WHERE is_creator = TRUE AND created_at IS NOT NULL
+            GROUP BY date_trunc('month', created_at)
+            ORDER BY cohort_month DESC
+            LIMIT 12
+        `);
+        
+        // Monthly churn
+        const churnData = await pool.query(`
+            SELECT 
+                COUNT(*) FILTER (WHERE is_active_creator = FALSE AND last_sale_at < NOW() - INTERVAL '30 days') as churned,
+                COUNT(*) as total
+            FROM users WHERE is_creator = TRUE
+        `);
+        const churnRate = churnData.rows[0].total > 0 
+            ? ((parseInt(churnData.rows[0].churned) / parseInt(churnData.rows[0].total)) * 100).toFixed(1) 
+            : 0;
+        
+        res.json({
+            summary: {
+                totalCreators: parseInt(totalCreators.rows[0].count),
+                activeCreators: parseInt(activeCreators.rows[0].count),
+                monthlyChurnRate: parseFloat(churnRate),
+                targets: { retention30d: 75, retention90d: 60, maxChurn: 8 }
+            },
+            cohorts: cohorts.rows.map(c => ({
+                month: c.cohort_month,
+                totalRegistered: parseInt(c.total_registered),
+                activeNow: parseInt(c.active_now),
+                retained30d: parseInt(c.retained_30d),
+                retained90d: parseInt(c.retained_90d),
+                retention30dPct: c.total_registered > 0 ? ((c.retained_30d / c.total_registered) * 100).toFixed(1) : 0,
+                retention90dPct: c.total_registered > 0 ? ((c.retained_90d / c.total_registered) * 100).toFixed(1) : 0
+            }))
+        });
+    } catch (error) {
+        console.error("Retention metrics error:", error);
+        res.status(500).json({ error: "Failed to fetch retention metrics" });
+    }
+});
+
+// Admin retention CSV export
+app.get("/api/admin/retention/export", authenticateToken, async (req, res) => {
+    try {
+        const userResult = await pool.query(`SELECT role FROM users WHERE id = $1`, [req.user.id]);
+        if (userResult.rows[0]?.role !== 'admin') {
+            return res.status(403).json({ error: "Admin access required" });
+        }
+        
+        const cohorts = await pool.query(`
+            SELECT 
+                date_trunc('month', created_at) as cohort_month,
+                COUNT(*) as total_registered,
+                COUNT(*) FILTER (WHERE is_active_creator = TRUE) as currently_active,
+                COUNT(*) FILTER (WHERE last_sale_at >= created_at + INTERVAL '30 days') as retained_30d,
+                COUNT(*) FILTER (WHERE last_sale_at >= created_at + INTERVAL '60 days') as retained_60d,
+                COUNT(*) FILTER (WHERE last_sale_at >= created_at + INTERVAL '90 days') as retained_90d,
+                COUNT(*) FILTER (WHERE last_sale_at >= created_at + INTERVAL '180 days') as retained_180d,
+                COUNT(*) FILTER (WHERE last_sale_at >= created_at + INTERVAL '365 days') as retained_365d
+            FROM users WHERE is_creator = TRUE AND created_at IS NOT NULL
+            GROUP BY date_trunc('month', created_at) ORDER BY cohort_month DESC
+        `);
+        
+        const headers = ['Cohort Month', 'Total Registered', 'Currently Active', '30d Retention', '60d Retention', '90d Retention', '180d Retention', '365d Retention'];
+        const rows = cohorts.rows.map(c => [
+            new Date(c.cohort_month).toISOString().slice(0, 7),
+            c.total_registered, c.currently_active, c.retained_30d, c.retained_60d, c.retained_90d, c.retained_180d, c.retained_365d
+        ]);
+        const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="retention-${Date.now()}.csv"`);
+        res.send(csv);
+    } catch (error) {
+        console.error("Retention export error:", error);
+        res.status(500).json({ error: "Failed to export retention data" });
+    }
+});
+
+// ========== REQ-13: Admin Promotions Management ==========
+
+app.get("/api/admin/promotions", authenticateToken, async (req, res) => {
+    try {
+        const userResult = await pool.query(`SELECT role FROM users WHERE id = $1`, [req.user.id]);
+        if (!['admin', 'moderator'].includes(userResult.rows[0]?.role)) {
+            return res.status(403).json({ error: "Admin access required" });
+        }
+        const result = await pool.query(`SELECT * FROM promotions ORDER BY id`);
+        res.json({ promotions: result.rows });
+    } catch (error) {
+        console.error("Promotions fetch error:", error);
+        res.status(500).json({ error: "Failed to fetch promotions" });
+    }
+});
+
+app.patch("/api/admin/promotions/:id", authenticateToken, async (req, res) => {
+    try {
+        const userResult = await pool.query(`SELECT role FROM users WHERE id = $1`, [req.user.id]);
+        if (userResult.rows[0]?.role !== 'admin') {
+            return res.status(403).json({ error: "Admin access required" });
+        }
+        const { active, config } = req.body;
+        const updates = [];
+        const params = [];
+        if (typeof active === 'boolean') {
+            params.push(active);
+            updates.push(`active = $${params.length}`);
+        }
+        if (config) {
+            params.push(JSON.stringify(config));
+            updates.push(`config = $${params.length}`);
+        }
+        if (updates.length === 0) return res.status(400).json({ error: "No updates" });
+        
+        params.push(req.params.id);
+        updates.push(`updated_at = NOW()`);
+        
+        const result = await pool.query(
+            `UPDATE promotions SET ${updates.join(', ')} WHERE id = $${params.length} RETURNING *`,
+            params
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: "Promotion not found" });
+        
+        res.json({ message: "Promotion updated", promotion: result.rows[0] });
+    } catch (error) {
+        console.error("Promotion update error:", error);
+        res.status(500).json({ error: "Failed to update promotion" });
+    }
+});
+
+// ========== CRON JOBS (REQ-09, REQ-14, REQ-15) ==========
+
+// Daily at midnight EAT (UTC+3 = 21:00 UTC): recalculate active/dormant status
+cron.schedule('0 21 * * *', async () => {
+    console.log('⏰ Running daily active/dormant status recalculation...');
+    try {
+        // Reset daily free credit usage
+        await pool.query(`UPDATE users SET free_credits_used_today = 0, free_credits_last_reset = CURRENT_DATE WHERE free_credits_last_reset < CURRENT_DATE OR free_credits_last_reset IS NULL`);
+        
+        // Recalculate active status
+        const creators = await pool.query(`SELECT id FROM users WHERE is_creator = TRUE`);
+        for (const creator of creators.rows) {
+            const active = await isCreatorActive(creator.id);
+            await pool.query(
+                `UPDATE users SET is_active_creator = $1 WHERE id = $2`,
+                [active, creator.id]
+            );
+        }
+        
+        // Update badge levels
+        const allCreators = await pool.query(`SELECT id, badge_level, badge_downgrade_start FROM users WHERE is_creator = TRUE`);
+        for (const creator of allCreators.rows) {
+            const subCount = await pool.query(
+                `SELECT COUNT(*) as count FROM subscriptions WHERE creator_id = $1 AND end_date > CURRENT_DATE AND payment_status = 'completed'`,
+                [creator.id]
+            );
+            const newLevel = calculateBadgeLevel(parseInt(subCount.rows[0].count));
+            
+            if (newLevel < creator.badge_level) {
+                // Start or continue downgrade grace period
+                if (!creator.badge_downgrade_start) {
+                    await pool.query(`UPDATE users SET badge_downgrade_start = CURRENT_DATE WHERE id = $1`, [creator.id]);
+                } else {
+                    const daysBelow = Math.floor((Date.now() - new Date(creator.badge_downgrade_start).getTime()) / (1000 * 60 * 60 * 24));
+                    if (daysBelow >= 90) {
+                        await pool.query(`UPDATE users SET badge_level = $1, badge_downgrade_start = NULL WHERE id = $2`, [newLevel, creator.id]);
+                    }
+                    // Day 60 warning would be handled by the dormancy email system
+                }
+            } else {
+                // At or above level — reset grace period and update level
+                await pool.query(`UPDATE users SET badge_level = $1, badge_downgrade_start = NULL WHERE id = $2`, [newLevel, creator.id]);
+            }
+        }
+        
+        // Expire free credits
+        await pool.query(`UPDATE users SET free_credits_remaining = 0 WHERE free_credits_expiry < NOW() AND free_credits_remaining > 0`);
+        
+        // Expire boosts
+        await pool.query(`UPDATE posts SET boost_package = NULL, boost_multiplier = 1 WHERE boost_expires_at < NOW() AND boost_package IS NOT NULL`);
+        
+        console.log('✅ Daily status recalculation complete');
+    } catch (error) {
+        console.error('❌ Daily cron error:', error);
+    }
+});
+
+// Daily at 10:00 EAT (07:00 UTC): Send dormancy warning emails (REQ-15)
+cron.schedule('0 7 * * *', async () => {
+    console.log('📧 Running dormancy email check...');
+    try {
+        // Find users at day 25 of inactivity
+        const day25Users = await pool.query(`
+            SELECT u.id, u.name, u.email, u.last_sale_at
+            FROM users u
+            WHERE u.is_creator = TRUE 
+            AND u.last_sale_at IS NOT NULL
+            AND u.last_sale_at < NOW() - INTERVAL '25 days'
+            AND u.last_sale_at >= NOW() - INTERVAL '26 days'
+            AND u.is_active_creator = TRUE
+            AND NOT EXISTS (SELECT 1 FROM dormancy_emails de WHERE de.user_id = u.id AND de.email_type = 'day25' AND de.sent_at > NOW() - INTERVAL '7 days')
+        `);
+        
+        for (const user of day25Users.rows) {
+            console.log(`📧 Would send day-25 dormancy email to ${user.email}`);
+            // TODO: Integrate with email service (SendGrid, Resend, etc.)
+            // For now, just log it
+            await pool.query(
+                `INSERT INTO dormancy_emails (user_id, email_type) VALUES ($1, 'day25')`,
+                [user.id]
+            );
+        }
+        
+        // Find users at day 27 of inactivity
+        const day27Users = await pool.query(`
+            SELECT u.id, u.name, u.email, u.last_sale_at
+            FROM users u
+            WHERE u.is_creator = TRUE 
+            AND u.last_sale_at IS NOT NULL
+            AND u.last_sale_at < NOW() - INTERVAL '27 days'
+            AND u.last_sale_at >= NOW() - INTERVAL '28 days'
+            AND u.is_active_creator = TRUE
+            AND NOT EXISTS (SELECT 1 FROM dormancy_emails de WHERE de.user_id = u.id AND de.email_type = 'day27' AND de.sent_at > NOW() - INTERVAL '7 days')
+        `);
+        
+        for (const user of day27Users.rows) {
+            console.log(`📧 Would send day-27 dormancy email to ${user.email}`);
+            await pool.query(
+                `INSERT INTO dormancy_emails (user_id, email_type) VALUES ($1, 'day27')`,
+                [user.id]
+            );
+        }
+        
+        console.log(`✅ Dormancy emails: ${day25Users.rowCount} day-25, ${day27Users.rowCount} day-27`);
+    } catch (error) {
+        console.error('❌ Dormancy email cron error:', error);
+    }
+});
+
+// Monthly on the 1st at midnight EAT: Disburse badge rewards (REQ-14)
+cron.schedule('0 21 1 * *', async () => {
+    console.log('🏅 Running monthly badge credit disbursement...');
+    try {
+        const creators = await pool.query(
+            `SELECT id, badge_level FROM users WHERE is_creator = TRUE AND badge_level > 0`
+        );
+        
+        for (const creator of creators.rows) {
+            const badge = BADGE_INFO[creator.badge_level];
+            if (badge && badge.credits > 0) {
+                await pool.query(
+                    `UPDATE users SET credits = credits + $1 WHERE id = $2`,
+                    [badge.credits, creator.id]
+                );
+                await pool.query(
+                    `INSERT INTO credit_transactions (user_id, amount, type, description, expires_at)
+                     VALUES ($1, $2, 'badge_reward', $3, NOW() + INTERVAL '90 days')`,
+                    [creator.id, badge.credits, `Monthly ${badge.name} badge reward`]
+                );
+                console.log(`🏅 Disbursed ${badge.credits} credits to creator #${creator.id} (${badge.name} badge)`);
+            }
+        }
+        
+        console.log(`✅ Monthly badge disbursement complete: ${creators.rowCount} creators processed`);
+    } catch (error) {
+        console.error('❌ Monthly badge cron error:', error);
+    }
+});
+
 // app.listen(port, () => {
 //     console.log(`🚀 Server running on port ${port}`);
 // });
@@ -3446,6 +4755,271 @@ io.on('connection', (socket) => {
     socket.on('join:conversation', ({ conversationId }) => {
         socket.join(`conversation:${conversationId}`);
     });
+});
+
+// ================== FOLLOWERS ENDPOINTS ==================
+
+// POST /api/follow/:creatorIdentifier - Toggle follow status
+app.post("/api/follow/:creatorIdentifier", authenticateToken, async (req, res) => {
+    const followerId = req.user.id;
+    const identifier = req.params.creatorIdentifier;
+    
+    let followingId;
+    if (!isNaN(identifier)) {
+        followingId = parseInt(identifier);
+    } else {
+        // Lookup by name
+        const userRes = await pool.query("SELECT id FROM users WHERE name = $1 LIMIT 1", [identifier]);
+        if (userRes.rowCount === 0) return res.status(404).json({ error: "Creator not found" });
+        followingId = userRes.rows[0].id;
+    }
+
+    if (followerId === followingId) {
+        return res.status(400).json({ error: "You cannot follow yourself" });
+    }
+
+    try {
+        // Check if currently following
+        const checkResult = await pool.query(
+            "SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2",
+            [followerId, followingId]
+        );
+
+        let isFollowing = false;
+
+        if (checkResult.rowCount > 0) {
+            // Unfollow
+            await pool.query(
+                "DELETE FROM followers WHERE follower_id = $1 AND following_id = $2",
+                [followerId, followingId]
+            );
+        } else {
+            // Follow
+            await pool.query(
+                "INSERT INTO followers (follower_id, following_id) VALUES ($1, $2)",
+                [followerId, followingId]
+            );
+            isFollowing = true;
+        }
+
+        // Get new followers count
+        const countResult = await pool.query(
+            "SELECT COUNT(*) FROM followers WHERE following_id = $1",
+            [followingId]
+        );
+        const followersCount = parseInt(countResult.rows[0].count);
+
+        res.json({ success: true, isFollowing, followersCount });
+    } catch (error) {
+        console.error("Follow error:", error);
+        res.status(500).json({ error: "Failed to process follow request" });
+    }
+});
+
+// GET /api/following - List creators current user follows
+app.get("/api/following", authenticateToken, async (req, res) => {
+    const userId = req.user.id;
+    try {
+        const result = await pool.query(`
+            SELECT u.id, u.name, cp.profile_image AS avatar_url, u.categories, cp.bio,
+                   (SELECT COUNT(*) FROM followers WHERE following_id = u.id) AS followers_count
+            FROM followers f
+            JOIN users u ON f.following_id = u.id
+            LEFT JOIN creators_page cp ON u.id = cp.user_id
+            WHERE f.follower_id = $1
+            ORDER BY f.created_at DESC
+        `, [userId]);
+        res.json(result.rows);
+    } catch (error) {
+        console.error("Fetch following error:", error);
+        res.status(500).json({ error: "Failed to fetch following" });
+    }
+});
+
+// GET /api/following/posts - Feed from followed creators
+app.get("/api/following/posts", authenticateToken, async (req, res) => {
+    const userId = req.user.id;
+    const { limit = 20, offset = 0 } = req.query;
+
+    try {
+        const parsedLimit = parseInt(limit);
+        const parsedOffset = parseInt(offset);
+
+        const result = await pool.query(`
+            SELECT 
+                p.id, p.type, p.title, p.caption, array_to_json(p.tags) AS tags,
+                p.images, p.video_url, p.audio_url, p.created_at, p.views,
+                p.duration, p.read_time, p.is_premium, p.visibility,
+                u.name AS creator_name, cp.profile_image AS creator_avatar,
+                u.badge_level AS creator_badge_level,
+                COUNT(DISTINCT l.id) AS likes, COUNT(DISTINCT c.id) AS comments,
+                EXISTS(SELECT 1 FROM likes WHERE user_id = $1 AND post_id = p.id) AS is_liked,
+                EXISTS(SELECT 1 FROM bookmarks WHERE user_id = $1 AND post_id = p.id) AS is_bookmarked
+            FROM posts p
+            JOIN followers f ON p.user_id = f.following_id
+            JOIN users u ON p.user_id = u.id
+            LEFT JOIN creators_page cp ON p.user_id = cp.user_id
+            LEFT JOIN likes l ON p.id = l.post_id
+            LEFT JOIN comments c ON p.id = c.post_id
+            WHERE f.follower_id = $1
+              AND p.is_draft = FALSE
+              AND p.status = 'approved'
+              AND p.expires_at > NOW()
+              AND p.visibility IN ('public', 'followers')
+              AND p.is_premium = FALSE
+            GROUP BY p.id, u.name, cp.profile_image, u.badge_level
+            ORDER BY p.created_at DESC
+            LIMIT $2 OFFSET $3
+        `, [userId, parsedLimit, parsedOffset]);
+
+        const posts = result.rows.map(post => ({
+            id: post.id,
+            type: post.type,
+            title: post.title,
+            caption: post.caption,
+            tags: post.tags,
+            images: post.images,
+            video_url: post.video_url,
+            audio_url: post.audio_url,
+            created_at: post.created_at,
+            views: post.views,
+            duration: post.duration,
+            read_time: post.read_time,
+            isPremium: post.is_premium,
+            visibility: post.visibility,
+            creatorName: post.creator_name,
+            creatorAvatar: post.creator_avatar || "https://placehold.co/40x40",
+            creatorBadgeLevel: post.creator_badge_level || 0,
+            likes: parseInt(post.likes) || 0,
+            comments: parseInt(post.comments) || 0,
+            isLiked: post.is_liked,
+            isBookmarked: post.is_bookmarked
+        }));
+
+        res.json({ posts });
+    } catch (error) {
+        console.error("Fetch following posts error:", error);
+        res.status(500).json({ error: "Failed to fetch following posts" });
+    }
+});
+
+// GET /api/creators/:creatorId/followers - Who follows this creator
+app.get("/api/creators/:creatorId/followers", authenticateToken, async (req, res) => {
+    const creatorId = parseInt(req.params.creatorId);
+    try {
+        const result = await pool.query(`
+            SELECT u.id, u.name, cp.profile_image AS avatar_url, cp.bio
+            FROM followers f
+            JOIN users u ON f.follower_id = u.id
+            LEFT JOIN creators_page cp ON u.id = cp.user_id
+            WHERE f.following_id = $1
+            ORDER BY f.created_at DESC
+        `, [creatorId]);
+        res.json(result.rows);
+    } catch (error) {
+        console.error("Fetch creator followers error:", error);
+        res.status(500).json({ error: "Failed to fetch followers" });
+    }
+});
+
+// GET /api/creators/:creatorId/following - Who this creator follows
+app.get("/api/creators/:creatorId/following", authenticateToken, async (req, res) => {
+    const creatorId = parseInt(req.params.creatorId);
+    try {
+        const result = await pool.query(`
+            SELECT u.id, u.name, cp.profile_image AS avatar_url, cp.bio
+            FROM followers f
+            JOIN users u ON f.following_id = u.id
+            LEFT JOIN creators_page cp ON u.id = cp.user_id
+            WHERE f.follower_id = $1
+            ORDER BY f.created_at DESC
+        `, [creatorId]);
+        res.json(result.rows);
+    } catch (error) {
+        console.error("Fetch creator following error:", error);
+        res.status(500).json({ error: "Failed to fetch following" });
+    }
+});
+
+// GET /api/creators/:creatorId/follow-status - Check follow state + mutual
+app.get("/api/creators/:creatorId/follow-status", authenticateToken, async (req, res) => {
+    const followerId = req.user.id;
+    const followingId = parseInt(req.params.creatorId);
+
+    try {
+        const checkResult = await pool.query(
+            "SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2",
+            [followerId, followingId]
+        );
+
+        const checkReverse = await pool.query(
+            "SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2",
+            [followingId, followerId]
+        );
+
+        const countResult = await pool.query(
+            "SELECT COUNT(*) FROM followers WHERE following_id = $1",
+            [followingId]
+        );
+
+        res.json({
+            isFollowing: checkResult.rowCount > 0,
+            isFollowedBy: checkReverse.rowCount > 0,
+            followersCount: parseInt(countResult.rows[0].count)
+        });
+    } catch (error) {
+        console.error("Follow status check error:", error);
+        res.status(500).json({ error: "Failed to check follow status" });
+    }
+});
+
+// GET /api/suggested-creators - Suggested creators logic
+app.get("/api/suggested-creators", authenticateToken, async (req, res) => {
+    const userId = req.user.id;
+    try {
+        // Query to find creators who follow the user, but the user doesn't follow back
+        const followsUserNotFollowedBack = await pool.query(`
+            SELECT u.id, u.name, cp.profile_image AS avatar_url, cp.bio, 'follows_you' as reason,
+                   (SELECT COUNT(*) FROM followers WHERE following_id = u.id) AS followers_count
+            FROM followers f
+            JOIN users u ON f.follower_id = u.id
+            LEFT JOIN creators_page cp ON u.id = cp.user_id
+            WHERE f.following_id = $1 
+            AND NOT EXISTS (
+                SELECT 1 FROM followers WHERE follower_id = $1 AND following_id = u.id
+            )
+            LIMIT 10
+        `, [userId]);
+
+        let suggested = followsUserNotFollowedBack.rows;
+
+        // If not enough, get top creators not already followed
+        if (suggested.length < 10) {
+            const topCreators = await pool.query(`
+                SELECT u.id, u.name, cp.profile_image AS avatar_url, cp.bio, 'popular' as reason,
+                       (SELECT COUNT(*) FROM followers WHERE following_id = u.id) AS followers_count
+                FROM users u
+                LEFT JOIN creators_page cp ON u.id = cp.user_id
+                WHERE u.is_creator = true 
+                  AND u.id != $1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM followers WHERE follower_id = $1 AND following_id = u.id
+                  )
+                  AND u.id NOT IN (
+                      SELECT follower_id FROM followers WHERE following_id = $1
+                  )
+                ORDER BY followers_count DESC
+                LIMIT $2
+            `, [userId, 10 - suggested.length]);
+            
+            suggested = suggested.concat(topCreators.rows);
+        }
+
+        res.json(suggested);
+    } catch (error) {
+        console.error("Fetch suggested creators error:", error);
+        res.status(500).json({ error: "Failed to fetch suggested creators" });
+    }
 });
 
 // REST Endpoints (for history and starting convos; authenticate with your middleware)
