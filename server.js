@@ -2670,6 +2670,32 @@ app.get("/creators/:creatorId/subscriber-count", async (req, res) => {
     }
 });
 
+// GET /creators/:id/followers - Get followers of a creator
+app.get("/creators/:id/followers", async (req, res) => {
+    const creatorId = parseInt(req.params.id);
+    
+    try {
+        // Validate creatorId
+        if (isNaN(creatorId)) {
+            return res.status(400).json({ error: "Invalid creator ID" });
+        }
+
+        const result = await pool.query(`
+            SELECT u.id, u.name, cp.profile_image AS avatar_url, cp.bio
+            FROM followers f
+            JOIN users u ON f.follower_id = u.id
+            LEFT JOIN creators_page cp ON u.id = cp.user_id
+            WHERE f.following_id = $1
+            ORDER BY f.created_at DESC
+        `, [creatorId]);
+
+        res.json(result.rows);
+    } catch (error) {
+        console.error("Fetch creator followers error:", error);
+        res.status(500).json({ error: "Failed to fetch followers", details: error.message });
+    }
+});
+
 // Fetch Total Likes, Comments, Views, Revenue, and Subscribers for a Creator
 app.get("/creators/:creatorId/stats", authenticateToken, async (req, res) => {
     const { creatorId } = req.params;
