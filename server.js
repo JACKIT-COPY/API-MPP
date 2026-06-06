@@ -2035,7 +2035,7 @@ app.get("/post/:id", async (req, res) => {
              LEFT JOIN likes l ON p.id = l.post_id
              LEFT JOIN comments c ON p.id = c.post_id
              WHERE p.id = $1 AND p.visibility = 'public' AND p.is_draft = FALSE AND p.expires_at > NOW() AND p.status IN ('pending', 'approved')
-             GROUP BY p.id, u.name, cp.profile_image, p.views`,
+             GROUP BY p.id, p.user_id, p.type, p.title, p.caption, p.tags, p.images, p.video_url, p.audio_url, p.created_at, p.is_premium, p.visibility, p.read_time, p.duration, p.status, u.name, cp.profile_image, u.badge_level, p.views`,
             [postId]
         );
 
