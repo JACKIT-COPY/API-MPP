@@ -3783,6 +3783,24 @@ app.get("/api/referrals/stats", authenticateToken, async (req, res) => {
     }
 });
 
+// Look up referrer by referral code
+app.get("/api/referrals/lookup/:code", async (req, res) => {
+    try {
+        const { code } = req.params;
+        const result = await pool.query(
+            "SELECT name FROM users WHERE referral_code = $1",
+            [code]
+        );
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: "Invalid referral code" });
+        }
+        res.json({ name: result.rows[0].name });
+    } catch (error) {
+        console.error("Referral lookup error:", error);
+        res.status(500).json({ error: "Failed to look up referral code" });
+    }
+});
+
 // Public referral page data (no auth needed)
 app.get("/api/referrals/info", async (req, res) => {
     res.json({
