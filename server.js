@@ -2489,7 +2489,7 @@ app.get("/top-creators", async (req, res) => {
             }
         }
 
-        const groupBy = ` GROUP BY u.id, u.name, u.bio, u.categories, cp.profile_image, cp.socials`;
+        const groupBy = ` GROUP BY u.id, u.name, u.bio, u.categories, cp.profile_image, cp.socials, mt.min_price`;
 
         let orderClause = ' ORDER BY follower_count DESC';
         if (sort === 'followers_desc' || sort === 'subscribers_desc') orderClause = ' ORDER BY follower_count DESC';
