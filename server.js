@@ -2455,7 +2455,10 @@ app.get("/top-creators", async (req, res) => {
                 u.categories,
                 cp.profile_image,
                 cp.socials,
-                COALESCE(COUNT(DISTINCT s.user_id) FILTER (WHERE s.end_date > CURRENT_DATE AND s.payment_status = 'completed'), 0) AS follower_count,
+                -- subscriber_count: active paid subscriptions
+                COALESCE(COUNT(DISTINCT s.user_id) FILTER (WHERE s.end_date > CURRENT_DATE AND s.payment_status = 'completed'), 0) AS subscriber_count,
+                -- followers_count: users who followed the creator (separate from paid subscribers)
+                (SELECT COUNT(*) FROM followers WHERE following_id = u.id) AS followers_count,
                 COALESCE(SUM(p.views) FILTER (WHERE p.expires_at > NOW()), 0) AS total_views,
                 COALESCE(mt.min_price, 499) AS monthly_tier_price,
                 MAX(p.created_at) AS last_post_at
@@ -2491,11 +2494,13 @@ app.get("/top-creators", async (req, res) => {
 
         const groupBy = ` GROUP BY u.id, u.name, u.bio, u.categories, cp.profile_image, cp.socials, mt.min_price`;
 
-        let orderClause = ' ORDER BY follower_count DESC';
-        if (sort === 'followers_desc' || sort === 'subscribers_desc') orderClause = ' ORDER BY follower_count DESC';
+        // Default ordering: by subscribers (paid subscriptions)
+        let orderClause = ' ORDER BY subscriber_count DESC';
+        if (sort === 'followers_desc') orderClause = ' ORDER BY followers_count DESC';
+        else if (sort === 'subscribers_desc') orderClause = ' ORDER BY subscriber_count DESC';
         else if (sort === 'newest') orderClause = ' ORDER BY u.created_at DESC';
         else if (sort === 'trending') orderClause = ' ORDER BY total_views DESC';
-        else if (sort === 'recommended') orderClause = ' ORDER BY follower_count DESC';
+        else if (sort === 'recommended') orderClause = ' ORDER BY subscriber_count DESC';
 
         const whereSQL = whereClauses.length ? ' WHERE ' + whereClauses.join(' AND ') : '';
 
@@ -2514,7 +2519,8 @@ app.get("/top-creators", async (req, res) => {
             categories: r.categories || [],
             profileImage: r.profile_image || 'https://placehold.co/200x200',
             socials: r.socials || {},
-            followerCount: parseInt(r.follower_count) || 0,
+            followersCount: parseInt(r.followers_count) || 0,
+            subscriberCount: parseInt(r.subscriber_count) || 0,
             totalViews: parseInt(r.total_views) || 0,
             monthlyTierPrice: parseInt(r.monthly_tier_price) || 499,
             lastPostAt: r.last_post_at
