@@ -2457,11 +2457,18 @@ app.get("/top-creators", async (req, res) => {
                 cp.socials,
                 COALESCE(COUNT(DISTINCT s.user_id) FILTER (WHERE s.end_date > CURRENT_DATE AND s.payment_status = 'completed'), 0) AS follower_count,
                 COALESCE(SUM(p.views) FILTER (WHERE p.expires_at > NOW()), 0) AS total_views,
+                COALESCE(mt.min_price, 499) AS monthly_tier_price,
                 MAX(p.created_at) AS last_post_at
             FROM users u
             JOIN creators_page cp ON u.id = cp.user_id
             LEFT JOIN subscriptions s ON s.creator_id = u.id
             LEFT JOIN posts p ON p.user_id = u.id
+            LEFT JOIN (
+                SELECT creator_id, MIN(price) AS min_price
+                FROM subscription_tiers
+                WHERE interval = 'month'
+                GROUP BY creator_id
+            ) mt ON mt.creator_id = u.id
         `;
 
         const whereClauses = [];
@@ -2509,6 +2516,7 @@ app.get("/top-creators", async (req, res) => {
             socials: r.socials || {},
             followerCount: parseInt(r.follower_count) || 0,
             totalViews: parseInt(r.total_views) || 0,
+            monthlyTierPrice: parseInt(r.monthly_tier_price) || 499,
             lastPostAt: r.last_post_at
         }));
 
