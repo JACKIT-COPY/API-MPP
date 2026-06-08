@@ -3905,12 +3905,49 @@ function calculateBadgeLevel(activeSubscribers) {
 }
 
 const BADGE_INFO = {
-    0: { name: 'None', color: '', credits: 0 },
-    1: { name: 'Sungura', color: 'bronze', credits: 150 },
-    2: { name: 'Mamba', color: 'silver', credits: 450 },
-    3: { name: 'Chui', color: 'gold', credits: 2500 },
-    4: { name: 'Simba', color: 'platinum', credits: 5000 },
-    5: { name: 'Nyota', color: 'diamond', credits: 7000 },
+    0: {
+        name: 'None',
+        color: '',
+        credits: 0,
+        label: 'No badge',
+        benefits: []
+    },
+    1: {
+        name: 'Sungura',
+        color: 'bronze',
+        credits: 150,
+        label: '10–19 subscribers',
+        benefits: ['150 Boost Credits']
+    },
+    2: {
+        name: 'Mamba',
+        color: 'silver',
+        credits: 450,
+        label: '20–49 subscribers',
+        benefits: ['450 Boost Credits']
+    },
+    3: {
+        name: 'Chui',
+        color: 'gold',
+        credits: 2500,
+        label: '50–199 subscribers',
+        benefits: ['2,500 Boost Credits', 'Featured in Trending']
+    },
+    4: {
+        name: 'Simba',
+        color: 'platinum',
+        credits: 5000,
+        label: '200–999 subscribers',
+        benefits: ['5,000 Boost Credits', 'Featured in Trending', 'Priority in Explore']
+    },
+    5: {
+        name: 'Nyota',
+        color: 'diamond',
+        credits: 7000,
+        label: '1,000+ subscribers',
+        benefits: ['7,000 Boost Credits', 'Featured in Trending', 'Priority in Explore', 'Featured on Homepage'],
+        style: 'iridescent'
+    },
 };
 
 // ========== REQ-10: Referral Program Endpoints ==========
@@ -4480,7 +4517,7 @@ app.get("/api/creators/:creatorId/badge", async (req, res) => {
             allBadges: Object.entries(BADGE_INFO).filter(([k]) => k !== '0').map(([k, v]) => ({
                 level: parseInt(k, 10),
                 ...v,
-                subscribers: k === '1' ? '10-19' : k === '2' ? '20-49' : k === '3' ? '50-199' : k === '4' ? '200-999' : '1,000+',
+                subscribers: v.label || (k === '1' ? '10-19' : k === '2' ? '20-49' : k === '3' ? '50-199' : k === '4' ? '200-999' : '1,000+'),
                 current: parseInt(k, 10) === badgeData.effectiveLevel
             }))
         });
