@@ -3598,37 +3598,88 @@ async function isCreatorActive(userId) {
     return false;
 }
 
+// ---- Helper: Determine whether a referred creator is active ----
+function isReferralActive(referral) {
+    if (referral.is_active_creator) {
+        return true;
+    }
+    if (referral.active_until && new Date(referral.active_until) > new Date()) {
+        return true;
+    }
+    if (referral.last_sale_at && (Date.now() - new Date(referral.last_sale_at).getTime()) < 30 * 24 * 60 * 60 * 1000) {
+        return true;
+    }
+    if (referral.created_at && (Date.now() - new Date(referral.created_at).getTime()) < 30 * 24 * 60 * 60 * 1000 && referral.sales_count > 0) {
+        return true;
+    }
+    return false;
+}
+
 // ---- Helper: Count active referrals for a referrer (REQ-08) ----
 async function countActiveReferrals(referrerId) {
     const result = await pool.query(
-        `SELECT u.id, u.last_sale_at, u.active_until, u.created_at
+        `SELECT u.id, u.last_sale_at, u.active_until, u.created_at, u.is_active_creator,
+                COALESCE(s.sales_count, 0) as sales_count
          FROM users u
+         LEFT JOIN (
+             SELECT creator_id, COUNT(*) as sales_count
+             FROM transactions
+             WHERE type = 'subscription' AND status = 'completed'
+             GROUP BY creator_id
+         ) s ON s.creator_id = u.id
          WHERE u.referred_by = $1`,
         [referrerId]
     );
+
     let activeCount = 0;
     for (const ref of result.rows) {
-        // New users active for first 30 days
-        if (ref.created_at && (Date.now() - new Date(ref.created_at).getTime()) < 30 * 24 * 60 * 60 * 1000) {
-            // Check if they have made at least one sale
-            const saleCheck = await pool.query(
-                `SELECT 1 FROM transactions WHERE creator_id = $1 AND type = 'subscription' AND status = 'completed' LIMIT 1`,
-                [ref.id]
-            );
-            if (saleCheck.rowCount > 0) { activeCount++; continue; }
-        }
-        if (ref.active_until && new Date(ref.active_until) > new Date()) {
-            const saleCheck = await pool.query(
-                `SELECT 1 FROM transactions WHERE creator_id = $1 AND type = 'subscription' AND status = 'completed' LIMIT 1`,
-                [ref.id]
-            );
-            if (saleCheck.rowCount > 0) { activeCount++; continue; }
-        }
-        if (ref.last_sale_at && (Date.now() - new Date(ref.last_sale_at).getTime()) < 30 * 24 * 60 * 60 * 1000) {
+        if (isReferralActive(ref)) {
             activeCount++;
         }
     }
     return activeCount;
+}
+
+async function getReferralDetails(referrerId) {
+    const referralsResult = await pool.query(
+        `SELECT u.id, u.name, u.email, u.created_at, u.last_sale_at, u.active_until,
+                u.referral_code, u.is_active_creator,
+                COALESCE(t.sales_count, 0) AS sales_count,
+                COALESCE(t.sales_total, 0) AS sales_total,
+                t.last_sale_date
+         FROM users u
+         LEFT JOIN (
+             SELECT creator_id,
+                    COUNT(*) AS sales_count,
+                    SUM(amount) AS sales_total,
+                    MAX(created_at) AS last_sale_date
+             FROM transactions
+             WHERE type = 'subscription' AND status = 'completed'
+             GROUP BY creator_id
+         ) t ON t.creator_id = u.id
+         WHERE u.referred_by = $1
+         ORDER BY u.created_at DESC`,
+        [referrerId]
+    );
+
+    return referralsResult.rows.map(ref => {
+        const isActive = isReferralActive(ref);
+        return {
+            id: ref.id,
+            name: ref.name || 'Creator',
+            email: ref.email || null,
+            referralCode: ref.referral_code || null,
+            joinedAt: ref.created_at,
+            activationDate: ref.last_sale_date || ref.created_at,
+            lastSaleAt: ref.last_sale_date || ref.last_sale_at,
+            activeUntil: ref.active_until,
+            salesCount: parseInt(ref.sales_count, 10) || 0,
+            salesTotal: parseFloat(ref.sales_total) || 0,
+            isActive,
+            status: isActive ? 'Active' : 'Inactive',
+            expectedCommissionRate: null
+        };
+    });
 }
 
 // ---- Helper: Process revenue split on subscription payment (REQ-08) ----
@@ -3758,8 +3809,8 @@ app.get("/api/referrals/stats", authenticateToken, async (req, res) => {
             `SELECT COUNT(*) as count FROM users WHERE referred_by = $1`, [userId]
         );
         
-        // Count active referrals
-        const activeCount = await countActiveReferrals(userId);
+        const referralDetails = await getReferralDetails(userId);
+        const activeCount = referralDetails.filter(r => r.isActive).length;
         
         // Total commission earned
         const commissions = await pool.query(
@@ -3778,6 +3829,10 @@ app.get("/api/referrals/stats", authenticateToken, async (req, res) => {
         
         // Commission tier
         const tier = activeCount >= 11 ? '15%' : '12%';
+        const tieredReferralDetails = referralDetails.map(ref => ({
+            ...ref,
+            expectedCommissionRate: tier
+        }));
         
         res.json({
             referralCode: userResult.rows[0]?.referral_code || null,
@@ -3789,7 +3844,8 @@ app.get("/api/referrals/stats", authenticateToken, async (req, res) => {
             activeReferrals: activeCount,
             currentTier: tier,
             totalCommissionEarned: parseFloat(commissions.rows[0].total),
-            monthlyCommission: parseFloat(monthlyCommissions.rows[0].total)
+            monthlyCommission: parseFloat(monthlyCommissions.rows[0].total),
+            referrals: tieredReferralDetails
         });
     } catch (error) {
         console.error("Referral stats error:", error);
@@ -3847,6 +3903,36 @@ const CREDIT_PACKAGES = [
     { id: 'pro', name: 'Pro', credits: 3000, price: 4999 }
 ];
 
+async function grantFreeCreditsForOnboarding(userId) {
+    const userResult = await pool.query(
+        `SELECT onboarding_email_verified, onboarding_profile_photo, onboarding_first_post,
+                free_credits_remaining, free_credits_expiry
+         FROM users WHERE id = $1`,
+        [userId]
+    );
+    if (userResult.rowCount === 0) return false;
+
+    const user = userResult.rows[0];
+    const onboardingComplete = user.onboarding_email_verified && user.onboarding_profile_photo && user.onboarding_first_post;
+    if (!onboardingComplete) return false;
+
+    const alreadyGranted = user.free_credits_expiry && new Date(user.free_credits_expiry) > new Date();
+    if (alreadyGranted || user.free_credits_remaining > 0) return false;
+
+    const expiry = new Date(Date.now() + 45 * 24 * 60 * 60 * 1000);
+    await pool.query(
+        `UPDATE users SET free_credits_remaining = 400, free_credits_expiry = $1, free_credits_last_reset = CURRENT_DATE WHERE id = $2`,
+        [expiry, userId]
+    );
+    await pool.query(
+        `INSERT INTO credit_transactions (user_id, amount, type, description, expires_at)
+         VALUES ($1, 400, 'free_credit_grant', 'Free onboarding credit grant', $2)`,
+        [userId, expiry]
+    );
+
+    return true;
+}
+
 // Get credit balance and packages
 app.get("/api/credits", authenticateToken, async (req, res) => {
     try {
@@ -3887,6 +3973,45 @@ app.get("/api/credits", authenticateToken, async (req, res) => {
     } catch (error) {
         console.error("Credits fetch error:", error);
         res.status(500).json({ error: "Failed to fetch credits" });
+    }
+});
+
+// Update onboarding completion state and grant free credits when eligible
+app.patch("/api/credits/onboarding", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { emailVerified, profilePhoto, firstPost } = req.body;
+        const updates = [];
+        const params = [];
+
+        if (emailVerified !== undefined) {
+            updates.push(`onboarding_email_verified = $${params.length + 1}`);
+            params.push(emailVerified);
+        }
+        if (profilePhoto !== undefined) {
+            updates.push(`onboarding_profile_photo = $${params.length + 1}`);
+            params.push(profilePhoto);
+        }
+        if (firstPost !== undefined) {
+            updates.push(`onboarding_first_post = $${params.length + 1}`);
+            params.push(firstPost);
+        }
+
+        if (!updates.length) {
+            return res.status(400).json({ error: "No onboarding fields provided" });
+        }
+
+        params.push(userId);
+        await pool.query(
+            `UPDATE users SET ${updates.join(', ')} WHERE id = $${params.length}`,
+            params
+        );
+
+        const freeCreditsGranted = await grantFreeCreditsForOnboarding(userId);
+        res.json({ success: true, freeCreditsGranted });
+    } catch (error) {
+        console.error("Onboarding update error:", error);
+        res.status(500).json({ error: "Failed to update onboarding state" });
     }
 });
 
