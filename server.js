@@ -4420,10 +4420,18 @@ async function processCreditPurchaseCallback(trans, ResultCode, transactionMpesa
             [totalCredits, trans.creator_id]
         );
 
+        const packageNameMatch = trans.description.match(/^(.+?)\s*\(/);
+        const packageName = packageNameMatch ? packageNameMatch[1].trim() : null;
+
         await pool.query(
-            `INSERT INTO credit_transactions (user_id, amount, type, description, expires_at)
-             VALUES ($1, $2, 'purchase', $3, NOW() + INTERVAL '90 days')`,
-            [trans.creator_id, totalCredits, `Purchased ${baseCredits} credits${bonusCredits > 0 ? ` + ${bonusCredits} bonus` : ''}`]
+            `INSERT INTO credit_transactions (user_id, amount, type, description, package_name, expires_at)
+             VALUES ($1, $2, 'purchase', $3, $4, NOW() + INTERVAL '90 days')`,
+            [
+                trans.creator_id,
+                totalCredits,
+                `Purchased ${baseCredits} credits${bonusCredits > 0 ? ` + ${bonusCredits} bonus` : ''}`,
+                packageName
+            ]
         );
     }
 }
