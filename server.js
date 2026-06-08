@@ -3255,7 +3255,7 @@ app.post("/creators/:creatorId/payouts/request", authenticateToken, async (req, 
 
         // Check pending payout balance
         const balanceQuery = `
-            SELECT COALESCE(SUM(CASE WHEN (t.type = 'subscription' OR t.type = 'referral_commission') AND t.status = 'completed' AND NOT EXISTS (
+            SELECT COALESCE(SUM(CASE WHEN (t.type = 'subscription' OR t.type = 'referral_commission' OR t.type = 'referral_fee' OR t.type = 'platform_fee') AND t.status = 'completed' AND NOT EXISTS (
                 SELECT 1 FROM transactions p WHERE p.type = 'payout' AND p.status = 'completed' AND p.created_at >= t.created_at
             ) THEN t.amount ELSE 0 END), 0) AS pending_payout
             FROM transactions t
