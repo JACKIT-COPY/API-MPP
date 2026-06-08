@@ -3241,13 +3241,13 @@ app.post("/creators/:creatorId/payouts/request", authenticateToken, async (req, 
             `SELECT payment_method, payout_threshold, mpesa_phone FROM payout_settings WHERE creator_id = $1`,
             [creatorId]
         );
-        const settings = settingsResult.rows[0] || { payout_threshold: 1, payment_method: 'mpesa', mpesa_phone: null };
+        const settings = settingsResult.rows[0] || { payout_threshold: 10, payment_method: 'mpesa', mpesa_phone: null };
         if (parsedAmount < settings.payout_threshold) {
             console.error(`Payout amount ${parsedAmount} below threshold ${settings.payout_threshold}`);
             return res.status(400).json({ error: `Payout amount must be at least KES ${settings.payout_threshold}` });
         }
 
-        const mpesaMinimum = parseInt(process.env.MPESA_B2C_MINIMUM_AMOUNT || '1', 10);
+        const mpesaMinimum = parseInt(process.env.MPESA_B2C_MINIMUM_AMOUNT || '10', 10);
         if (settings.payment_method === 'mpesa' && parsedAmount < mpesaMinimum) {
             console.error(`Payout amount ${parsedAmount} below M-Pesa minimum ${mpesaMinimum}`);
             return res.status(400).json({ error: `M-Pesa payouts require a minimum amount of KES ${mpesaMinimum}` });
@@ -3374,7 +3374,7 @@ app.post("/api/mpesa/b2c_callback", async (req, res) => {
         }
 
         const { ResultCode, ResultDesc, OriginatorConversationID, TransactionID } = result;
-        const status = ResultCode === '0' ? 'completed' : 'failed';
+        const status = (ResultCode === 0 || ResultCode === '0') ? 'completed' : 'failed';
 
         // Find the transaction by OriginatorConversationID
         const transResult = await pool.query(
