@@ -3664,6 +3664,33 @@ async function getReferralDetails(referrerId) {
 
     return referralsResult.rows.map(ref => {
         const isActive = isReferralActive(ref);
+        const salesCount = parseInt(ref.sales_count, 10) || 0;
+        const salesTotal = parseFloat(ref.sales_total) || 0;
+        const lastSaleDate = ref.last_sale_date ? new Date(ref.last_sale_date) : null;
+        const createdAtDate = ref.created_at ? new Date(ref.created_at) : null;
+
+        const hasSales = salesCount > 0;
+        const recentSale = lastSaleDate && (Date.now() - lastSaleDate.getTime()) < 30 * 24 * 60 * 60 * 1000;
+        const activeUntilValid = ref.active_until && new Date(ref.active_until) > new Date();
+        const newUserWithin30 = createdAtDate && (Date.now() - createdAtDate.getTime()) < 30 * 24 * 60 * 60 * 1000 && hasSales;
+
+        const checks = {
+            isActiveCreator: !!ref.is_active_creator,
+            hasSales,
+            recentSale,
+            activeUntilValid,
+            newUserWithin30
+        };
+
+        const failingChecks = [];
+        if (!checks.isActiveCreator) failingChecks.push('Creator account not marked active');
+        if (!checks.hasSales) failingChecks.push('No completed sales');
+        if (!checks.recentSale) failingChecks.push('No sale in last 30 days');
+        if (!checks.activeUntilValid) failingChecks.push('Not within paid active period');
+        if (!checks.newUserWithin30 && createdAtDate && (Date.now() - createdAtDate.getTime()) < 30 * 24 * 60 * 60 * 1000) {
+            failingChecks.push('New user with no qualifying sale yet');
+        }
+
         return {
             id: ref.id,
             name: ref.name || 'Creator',
@@ -3673,10 +3700,12 @@ async function getReferralDetails(referrerId) {
             activationDate: ref.last_sale_date || ref.created_at,
             lastSaleAt: ref.last_sale_date || ref.last_sale_at,
             activeUntil: ref.active_until,
-            salesCount: parseInt(ref.sales_count, 10) || 0,
-            salesTotal: parseFloat(ref.sales_total) || 0,
+            salesCount,
+            salesTotal,
             isActive,
             status: isActive ? 'Active' : 'Inactive',
+            checks,
+            failingChecks,
             expectedCommissionRate: null
         };
     });
