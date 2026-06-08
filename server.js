@@ -659,7 +659,8 @@ app.get("/moderation/posts", authenticateToken, async (req, res) => {
         }
 
         query += `
-            GROUP BY p.id, u.name, cp.profile_image, p.views
+            GROUP BY p.id, p.user_id, p.type, p.title, p.caption, p.images, p.video_url, p.audio_url, p.created_at, p.status, p.views,
+                     p.duration, p.read_time, u.name, cp.profile_image, u.badge_level
         `;
 
         switch (sort) {
