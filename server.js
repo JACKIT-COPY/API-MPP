@@ -4099,19 +4099,60 @@ const CREDIT_PACKAGES = [
     { id: 'pro', name: 'Pro', credits: 3000, price: 4999 }
 ];
 
-async function grantFreeCreditsForOnboarding(userId) {
+async function deriveOnboardingState(userId) {
     const userResult = await pool.query(
-        `SELECT onboarding_email_verified, onboarding_profile_photo, onboarding_first_post,
-                free_credits_remaining, free_credits_expiry
+        `SELECT email FROM users WHERE id = $1`,
+        [userId]
+    );
+    if (userResult.rowCount === 0) return null;
+
+    const creatorPageResult = await pool.query(
+        `SELECT profile_image FROM creators_page WHERE user_id = $1`,
+        [userId]
+    );
+
+    const postCountResult = await pool.query(
+        `SELECT COUNT(*) AS count
+         FROM posts
+         WHERE user_id = $1
+           AND visibility = 'public'
+           AND is_draft = FALSE
+           AND expires_at > NOW()
+           AND status IN ('pending', 'approved')`,
+        [userId]
+    );
+
+    const user = userResult.rows[0];
+    const profile = creatorPageResult.rows[0] || {};
+    const posts = parseInt(postCountResult.rows[0]?.count || 0, 10);
+
+    const emailVerified = Boolean(user.email);
+    const profilePhoto = Boolean(profile.profile_image && profile.profile_image.trim() !== '');
+    const firstPost = posts > 0;
+    const complete = emailVerified && profilePhoto && firstPost;
+
+    return {
+        emailVerified,
+        profilePhoto,
+        firstPost,
+        complete
+    };
+}
+
+async function grantFreeCreditsForOnboarding(userId, onboarding = null) {
+    if (!onboarding) {
+        onboarding = await deriveOnboardingState(userId);
+    }
+    if (!onboarding || !onboarding.complete) return false;
+
+    const userResult = await pool.query(
+        `SELECT free_credits_remaining, free_credits_expiry
          FROM users WHERE id = $1`,
         [userId]
     );
     if (userResult.rowCount === 0) return false;
 
     const user = userResult.rows[0];
-    const onboardingComplete = user.onboarding_email_verified && user.onboarding_profile_photo && user.onboarding_first_post;
-    if (!onboardingComplete) return false;
-
     const alreadyGranted = user.free_credits_expiry && new Date(user.free_credits_expiry) > new Date();
     if (alreadyGranted || user.free_credits_remaining > 0) return false;
 
@@ -4133,36 +4174,32 @@ async function grantFreeCreditsForOnboarding(userId) {
 app.get("/api/credits", authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
+        const onboarding = await deriveOnboardingState(userId);
+
+        // Automatically grant onboarding free credits if the user now qualifies.
+        await grantFreeCreditsForOnboarding(userId, onboarding);
+
         const user = await pool.query(
-            `SELECT credits, free_credits_remaining, free_credits_expiry, free_credits_used_today, 
-                    onboarding_email_verified, onboarding_profile_photo, onboarding_first_post
+            `SELECT credits, free_credits_remaining, free_credits_expiry, free_credits_used_today
              FROM users WHERE id = $1`, [userId]
         );
-        
         if (user.rowCount === 0) return res.status(404).json({ error: "User not found" });
-        
+
         const u = user.rows[0];
         const freeCreditsActive = u.free_credits_expiry && new Date(u.free_credits_expiry) > new Date();
-        const onboardingComplete = u.onboarding_email_verified && u.onboarding_profile_photo && u.onboarding_first_post;
-        
-        // Recent credit transactions
+
         const history = await pool.query(
             `SELECT amount, type, description, created_at FROM credit_transactions
              WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`, [userId]
         );
-        
+
         res.json({
             credits: u.credits,
             freeCreditsRemaining: freeCreditsActive ? u.free_credits_remaining : 0,
             freeCreditsExpiry: freeCreditsActive ? u.free_credits_expiry : null,
             freeCreditsUsedToday: u.free_credits_used_today,
             dailyFreeCreditCap: 150,
-            onboarding: {
-                emailVerified: u.onboarding_email_verified,
-                profilePhoto: u.onboarding_profile_photo,
-                firstPost: u.onboarding_first_post,
-                complete: onboardingComplete
-            },
+            onboarding,
             packages: CREDIT_PACKAGES,
             history: history.rows
         });
