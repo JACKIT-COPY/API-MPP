@@ -1393,6 +1393,8 @@ app.get("/verify", authenticateToken, async (req, res) => {
           u.role,
           u.is_creator,
           u.is_active_creator,
+          u.badge_level,
+          u.badge_downgrade_start,
           cp.profile_image,
           cp.bio AS creator_bio,
           cp.socials
@@ -1423,7 +1425,9 @@ app.get("/verify", authenticateToken, async (req, res) => {
         profileImage: finalProfileImage,  // both for backward compat
         isCreator: !!row.is_creator || !!row.profile_image,  // true if either exists
         role: row.role || "user",
-        socials: row.socials || {}
+        socials: row.socials || {},
+        badge_level: row.badge_level || 0,
+        badge_downgrade_start: row.badge_downgrade_start || null
       }
     });
 
@@ -1484,6 +1488,7 @@ app.put("/profile", authenticateToken, async (req, res) => {
     const verifyResult = await pool.query(
       `SELECT 
           u.name, u.email, u.bio, u.categories, u.role,
+          u.badge_level, u.badge_downgrade_start,
           cp.profile_image,
           cp.bio AS creator_bio,
           cp.socials
@@ -1508,7 +1513,9 @@ app.put("/profile", authenticateToken, async (req, res) => {
         profile_image: finalProfileImage,
         profileImage: finalProfileImage,
         isCreator: true,
-        role: row.role
+        role: row.role,
+        badge_level: row.badge_level || 0,
+        badge_downgrade_start: row.badge_downgrade_start || null
       }
     });
 
@@ -1574,6 +1581,7 @@ app.patch("/profile", authenticateToken, async (req, res) => {
     const verifyResult = await pool.query(
       `SELECT 
           u.name, u.email, u.bio, u.categories, u.role,
+          u.badge_level, u.badge_downgrade_start,
           cp.profile_image,
           cp.bio AS creator_bio,
           cp.socials
@@ -1598,7 +1606,9 @@ app.patch("/profile", authenticateToken, async (req, res) => {
         profile_image: finalProfileImage,
         profileImage: finalProfileImage,
         isCreator: true,
-        role: row.role
+        role: row.role,
+        badge_level: row.badge_level || 0,
+        badge_downgrade_start: row.badge_downgrade_start || null
       }
     });
 
