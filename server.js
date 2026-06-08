@@ -4093,7 +4093,7 @@ app.get("/api/referrals/info", async (req, res) => {
 // ========== REQ-11: Credit System Endpoints ==========
 
 const CREDIT_PACKAGES = [
-    { id: 'starter', name: 'Starter', credits: 100, price: 249 },
+    { id: 'starter', name: 'Starter', credits: 100, price: 1 },
     { id: 'value', name: 'Value', credits: 500, price: 999 },
     { id: 'growth', name: 'Growth', credits: 1200, price: 2199 },
     { id: 'pro', name: 'Pro', credits: 3000, price: 4999 }
