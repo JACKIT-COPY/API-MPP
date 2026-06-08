@@ -552,7 +552,7 @@ pool.query(`
 `).then(() => {
     return pool.query(`
         ALTER TABLE transactions ADD CONSTRAINT transactions_type_check
-        CHECK (type IN ('subscription', 'payout', 'referral_commission', 'credit_purchase', 'reactivation_fee', 'badge_reward'))
+        CHECK (type IN ('subscription', 'payout', 'referral_commission', 'platform_fee', 'credit_purchase', 'reactivation_fee', 'badge_reward'))
     `);
 }).then(() => console.log("Transactions type constraint updated"))
   .catch(err => console.error("Error updating transactions type constraint:", err));
@@ -997,14 +997,15 @@ app.post("/api/mpesa/callback", async (req, res) => {
             [status, transactionId || CheckoutRequestID, subscriptionId]
         );
 
-        // Insert into transactions
+        // Insert creator transaction with net amount after referral/platform split
+        const creatorAmount = status === 'completed' ? amount * 0.85 : amount;
         await pool.query(
             `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
             [
                 creatorId,
                 'subscription',
-                amount,
+                creatorAmount,
                 status,
                 transactionId || CheckoutRequestID,
                 `Subscription payment for ID ${subscriptionId}`
@@ -3184,7 +3185,7 @@ app.get("/creators/:creatorId/earnings", authenticateToken, async (req, res) => 
             lastPayoutDate: earningsResult.rows[0].last_payout_date ? earningsResult.rows[0].last_payout_date.toISOString() : null,
             transactions: transactionsResult.rows.map(t => ({
                 date: t.date.toISOString(),
-                type: t.type.charAt(0).toUpperCase() + t.type.slice(1),
+                type: t.type.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
                 description: t.description,
                 amount: parseFloat(t.amount),
                 status: t.status.charAt(0).toUpperCase() + t.status.slice(1)
@@ -3774,6 +3775,15 @@ async function processRevenueSplit(subscriptionId, creatorId, totalAmount, trans
             `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
              VALUES ($1, 'referral_commission', $2, 'completed', $3, $4)`,
             [referrerId, referrerAmount, `RC-${transactionId}`, `Referral commission (${referrerTier}) from creator #${creatorId}`]
+        );
+    }
+
+    // Record platform fee deduction for the creator so they can see where the money went
+    if (platformAmount > 0) {
+        await pool.query(
+            `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+             VALUES ($1, 'platform_fee', $2, 'completed', $3, $4)`,
+            [creatorId, -platformAmount, `PF-${transactionId}`, `Platform fee (${Math.round((platformAmount / totalAmount) * 100)}%) for subscription #${subscriptionId}`]
         );
     }
 
