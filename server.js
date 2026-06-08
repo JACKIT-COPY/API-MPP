@@ -3800,7 +3800,49 @@ async function processRevenueSplit(subscriptionId, creatorId, totalAmount, trans
         [creatorId]
     );
 
+    // Update badge level right after a successful subscription sale
+    await updateCreatorBadgeLevel(creatorId);
+
     return { creatorAmount, referrerAmount, platformAmount, referrerTier };
+}
+
+// ---- Helper: Update creator badge level with 90-day downgrade grace period ----
+async function updateCreatorBadgeLevel(creatorId) {
+    const creatorResult = await pool.query(
+        `SELECT badge_level, badge_downgrade_start FROM users WHERE id = $1`,
+        [creatorId]
+    );
+    if (creatorResult.rowCount === 0) return;
+
+    const creator = creatorResult.rows[0];
+    const subCountResult = await pool.query(
+        `SELECT COUNT(*) as count FROM subscriptions
+         WHERE creator_id = $1 AND end_date > CURRENT_DATE AND payment_status = 'completed'`,
+        [creatorId]
+    );
+    const newLevel = calculateBadgeLevel(parseInt(subCountResult.rows[0].count, 10));
+
+    if (newLevel < creator.badge_level) {
+        if (!creator.badge_downgrade_start) {
+            await pool.query(
+                `UPDATE users SET badge_downgrade_start = CURRENT_DATE WHERE id = $1`,
+                [creatorId]
+            );
+        } else {
+            const daysBelow = Math.floor((Date.now() - new Date(creator.badge_downgrade_start).getTime()) / (1000 * 60 * 60 * 24));
+            if (daysBelow >= 90) {
+                await pool.query(
+                    `UPDATE users SET badge_level = $1, badge_downgrade_start = NULL WHERE id = $2`,
+                    [newLevel, creatorId]
+                );
+            }
+        }
+    } else {
+        await pool.query(
+            `UPDATE users SET badge_level = $1, badge_downgrade_start = NULL WHERE id = $2`,
+            [newLevel, creatorId]
+        );
+    }
 }
 
 // ---- Helper: Calculate badge level (REQ-14) ----
@@ -4402,12 +4444,14 @@ app.get("/api/creators/:creatorId/badge", async (req, res) => {
         res.json({
             subscriberCount,
             calculatedLevel: level,
+            storedLevel,
             effectiveLevel,
             badge: {
                 name: effectiveBadge.name,
                 color: effectiveBadge.color,
                 monthlyCredits: effectiveBadge.credits
             },
+            badgeDowngradeStart: userResult.rows[0]?.badge_downgrade_start || null,
             allBadges: Object.entries(BADGE_INFO).filter(([k]) => k !== '0').map(([k, v]) => ({
                 level: parseInt(k),
                 ...v,
