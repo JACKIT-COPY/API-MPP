@@ -2369,9 +2369,12 @@ app.get("/creator/:creatorName", async (req, res) => {
 
         const stats = {
             posts: postsResult.rowCount,
-            subscribers: Math.floor(Math.random() * 50000),
+            subscribers: 0,
             views: postsResult.rows.reduce((sum, post) => sum + (parseInt(post.views) || 0), 0)
         };
+
+        const badgeData = await getCreatorBadgeData(creator.id);
+        stats.subscribers = badgeData.activeSubscribers;
 
         const response = {
             creator: {
@@ -2379,7 +2382,9 @@ app.get("/creator/:creatorName", async (req, res) => {
                 name: creator.name,
                 bio: creator.bio || "",
                 categories: creator.categories || [],
-                badge_level: creator.badge_level || 0,
+                badge_level: badgeData.effectiveLevel,
+                badge: badgeData.badge,
+                badgeDowngradeStart: badgeData.badgeDowngradeStart,
                 is_active_creator: creator.is_active_creator,
                 profileImage: creator.profile_image || "https://placehold.co/200x200",
                 socials: creator.socials || {}
@@ -2456,6 +2461,7 @@ app.get("/top-creators", async (req, res) => {
                 u.categories,
                 cp.profile_image,
                 cp.socials,
+                u.badge_level AS stored_badge_level,
                 -- subscriber_count: active paid subscriptions
                 COALESCE(COUNT(DISTINCT s.user_id) FILTER (WHERE s.end_date > CURRENT_DATE AND s.payment_status = 'completed'), 0) AS subscriber_count,
                 -- followers_count: users who followed the creator (separate from paid subscribers)
@@ -2493,7 +2499,7 @@ app.get("/top-creators", async (req, res) => {
             }
         }
 
-        const groupBy = ` GROUP BY u.id, u.name, u.bio, u.categories, cp.profile_image, cp.socials, mt.min_price`;
+        const groupBy = ` GROUP BY u.id, u.name, u.bio, u.categories, cp.profile_image, cp.socials, u.badge_level, mt.min_price`;
 
         // Default ordering: by subscribers (paid subscriptions)
         let orderClause = ' ORDER BY subscriber_count DESC';
@@ -2520,6 +2526,17 @@ app.get("/top-creators", async (req, res) => {
             categories: r.categories || [],
             profileImage: r.profile_image || 'https://placehold.co/200x200',
             socials: r.socials || {},
+            badge_level: Math.max(parseInt(r.stored_badge_level) || 0, calculateBadgeLevel(parseInt(r.subscriber_count) || 0)),
+            badge: (() => {
+                const level = Math.max(parseInt(r.stored_badge_level) || 0, calculateBadgeLevel(parseInt(r.subscriber_count) || 0));
+                const badge = BADGE_INFO[level] || BADGE_INFO[0];
+                return {
+                    level,
+                    name: badge.name,
+                    color: badge.color,
+                    monthlyCredits: badge.credits
+                };
+            })(),
             followersCount: parseInt(r.followers_count) || 0,
             subscriberCount: parseInt(r.subscriber_count) || 0,
             totalViews: parseInt(r.total_views) || 0,
@@ -3845,6 +3862,38 @@ async function updateCreatorBadgeLevel(creatorId) {
     }
 }
 
+async function getCreatorBadgeData(creatorId) {
+    const subscriberResult = await pool.query(
+        `SELECT COUNT(*) AS count FROM subscriptions
+         WHERE creator_id = $1 AND end_date > CURRENT_DATE AND payment_status = 'completed'`,
+        [creatorId]
+    );
+    const activeSubscribers = parseInt(subscriberResult.rows[0].count, 10) || 0;
+
+    const userResult = await pool.query(
+        `SELECT badge_level, badge_downgrade_start FROM users WHERE id = $1`,
+        [creatorId]
+    );
+    const storedLevel = parseInt(userResult.rows[0]?.badge_level || 0, 10);
+    const calculatedLevel = calculateBadgeLevel(activeSubscribers);
+    const effectiveLevel = Math.max(calculatedLevel, storedLevel);
+    const badge = BADGE_INFO[effectiveLevel] || BADGE_INFO[0];
+
+    return {
+        activeSubscribers,
+        calculatedLevel,
+        storedLevel,
+        effectiveLevel,
+        badge: {
+            level: effectiveLevel,
+            name: badge.name,
+            color: badge.color,
+            monthlyCredits: badge.credits
+        },
+        badgeDowngradeStart: userResult.rows[0]?.badge_downgrade_start || null
+    };
+}
+
 // ---- Helper: Calculate badge level (REQ-14) ----
 function calculateBadgeLevel(activeSubscribers) {
     if (activeSubscribers >= 1000) return 5;
@@ -4420,43 +4469,19 @@ app.get("/api/creators/:creatorId/badge", async (req, res) => {
     try {
         const creatorId = parseInt(req.params.creatorId);
         if (isNaN(creatorId)) return res.status(400).json({ error: "Invalid creator ID" });
-        
-        // Count active paying subscribers
-        const subResult = await pool.query(
-            `SELECT COUNT(*) as count FROM subscriptions
-             WHERE creator_id = $1 AND end_date > CURRENT_DATE AND payment_status = 'completed'`,
-            [creatorId]
-        );
-        const subscriberCount = parseInt(subResult.rows[0].count);
-        const level = calculateBadgeLevel(subscriberCount);
-        const badge = BADGE_INFO[level];
-        
-        // Get stored badge level for grace period check
-        const userResult = await pool.query(
-            `SELECT badge_level, badge_downgrade_start FROM users WHERE id = $1`, [creatorId]
-        );
-        const storedLevel = userResult.rows[0]?.badge_level || 0;
-        
-        // Use the higher of stored or calculated level (grace period)
-        const effectiveLevel = Math.max(level, storedLevel);
-        const effectiveBadge = BADGE_INFO[effectiveLevel];
-        
+        const badgeData = await getCreatorBadgeData(creatorId);
         res.json({
-            subscriberCount,
-            calculatedLevel: level,
-            storedLevel,
-            effectiveLevel,
-            badge: {
-                name: effectiveBadge.name,
-                color: effectiveBadge.color,
-                monthlyCredits: effectiveBadge.credits
-            },
-            badgeDowngradeStart: userResult.rows[0]?.badge_downgrade_start || null,
+            subscriberCount: badgeData.activeSubscribers,
+            calculatedLevel: badgeData.calculatedLevel,
+            storedLevel: badgeData.storedLevel,
+            effectiveLevel: badgeData.effectiveLevel,
+            badge: badgeData.badge,
+            badgeDowngradeStart: badgeData.badgeDowngradeStart,
             allBadges: Object.entries(BADGE_INFO).filter(([k]) => k !== '0').map(([k, v]) => ({
-                level: parseInt(k),
+                level: parseInt(k, 10),
                 ...v,
                 subscribers: k === '1' ? '10-19' : k === '2' ? '20-49' : k === '3' ? '50-199' : k === '4' ? '200-999' : '1,000+',
-                current: parseInt(k) === effectiveLevel
+                current: parseInt(k, 10) === badgeData.effectiveLevel
             }))
         });
     } catch (error) {
@@ -4538,32 +4563,27 @@ app.post("/api/account/reactivate", authenticateToken, async (req, res) => {
         
         if (paymentMethod === 'wallet') {
             // Check wallet balance
-            const balanceQuery = `
-                SELECT COALESCE(SUM(CASE WHEN type = 'subscription' AND status = 'completed' THEN amount 
-                                          WHEN type = 'referral_commission' AND status = 'completed' THEN amount
-                                          WHEN type = 'payout' AND status = 'completed' THEN amount
-                                          ELSE 0 END), 0) AS balance
-                FROM transactions WHERE creator_id = $1
-            `;
-            const balance = await pool.query(balanceQuery, [userId]);
-            if (parseFloat(balance.rows[0].balance) < 199) {
+            const balanceResult = await pool.query(
+                `SELECT COALESCE(SUM(CASE WHEN type IN ('subscription', 'referral_commission') AND status = 'completed' THEN amount ELSE 0 END), 0) AS balance
+                 FROM transactions
+                 WHERE creator_id = $1`,
+                [userId]
+            );
+            const balance = parseFloat(balanceResult.rows[0].balance) || 0;
+            if (balance < 199) {
                 return res.status(400).json({ error: "Insufficient wallet balance" });
             }
-            
-            // Deduct from wallet
-            await pool.query(
-                `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
-                 VALUES ($1, 'reactivation_fee', -199, 'completed', $2, 'Account reactivation fee - 60 days active')`,
-                [userId, `REACT-${Date.now()}`]
-            );
-            
-            // Set active for 60 days
+
             const activeUntil = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
             await pool.query(
                 `UPDATE users SET is_active_creator = TRUE, active_until = $1 WHERE id = $2`,
                 [activeUntil, userId]
             );
-            
+            await pool.query(
+                `INSERT INTO transactions (creator_id, type, amount, status, description) VALUES ($1, 'reactivation_fee', -199, 'completed', 'Reactivation fee')`,
+                [userId]
+            );
+
             return res.json({ message: "Account reactivated!", activeUntil });
         }
         
