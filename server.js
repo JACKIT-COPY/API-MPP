@@ -552,7 +552,7 @@ pool.query(`
 `).then(() => {
     return pool.query(`
         ALTER TABLE transactions ADD CONSTRAINT transactions_type_check
-        CHECK (type IN ('subscription', 'payout', 'referral_commission', 'platform_fee', 'credit_purchase', 'reactivation_fee', 'badge_reward'))
+        CHECK (type IN ('subscription', 'payout', 'referral_commission', 'referral_fee', 'platform_fee', 'credit_purchase', 'reactivation_fee', 'badge_reward'))
     `);
 }).then(() => console.log("Transactions type constraint updated"))
   .catch(err => console.error("Error updating transactions type constraint:", err));
@@ -997,15 +997,14 @@ app.post("/api/mpesa/callback", async (req, res) => {
             [status, transactionId || CheckoutRequestID, subscriptionId]
         );
 
-        // Insert creator transaction with net amount after referral/platform split
-        const creatorAmount = status === 'completed' ? amount * 0.85 : amount;
+        // Insert creator transaction with gross subscription amount
         await pool.query(
             `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
             [
                 creatorId,
                 'subscription',
-                creatorAmount,
+                amount,
                 status,
                 transactionId || CheckoutRequestID,
                 `Subscription payment for ID ${subscriptionId}`
@@ -3143,8 +3142,8 @@ app.get("/creators/:creatorId/earnings", authenticateToken, async (req, res) => 
         // Query earnings data
         const earningsQuery = `
             SELECT 
-                COALESCE(SUM(CASE WHEN (t.type = 'subscription' OR t.type = 'referral_commission') AND t.status = 'completed' THEN t.amount ELSE 0 END), 0) AS total_earnings,
-                COALESCE(SUM(CASE WHEN (t.type = 'subscription' OR t.type = 'referral_commission') AND t.status = 'completed' AND NOT EXISTS (
+                COALESCE(SUM(CASE WHEN (t.type = 'subscription' OR t.type = 'referral_commission' OR t.type = 'referral_fee' OR t.type = 'platform_fee') AND t.status = 'completed' THEN t.amount ELSE 0 END), 0) AS total_earnings,
+                COALESCE(SUM(CASE WHEN (t.type = 'subscription' OR t.type = 'referral_commission' OR t.type = 'referral_fee' OR t.type = 'platform_fee') AND t.status = 'completed' AND NOT EXISTS (
                     SELECT 1 FROM transactions p WHERE p.type = 'payout' AND p.status = 'completed' AND p.created_at >= t.created_at
                 ) THEN t.amount ELSE 0 END), 0) AS pending_payout,
                 COALESCE(SUM(CASE WHEN t.type = 'referral_commission' AND t.status = 'completed' THEN t.amount ELSE 0 END), 0) AS total_referral_earnings,
@@ -3775,6 +3774,13 @@ async function processRevenueSplit(subscriptionId, creatorId, totalAmount, trans
             `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
              VALUES ($1, 'referral_commission', $2, 'completed', $3, $4)`,
             [referrerId, referrerAmount, `RC-${transactionId}`, `Referral commission (${referrerTier}) from creator #${creatorId}`]
+        );
+
+        // Record referral fee deduction for the creator
+        await pool.query(
+            `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+             VALUES ($1, 'referral_fee', $2, 'completed', $3, $4)`,
+            [creatorId, -referrerAmount, `RF-${transactionId}`, `Referral fee (${referrerTier}) for subscription #${subscriptionId}`]
         );
     }
 
