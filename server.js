@@ -3142,8 +3142,8 @@ app.get("/creators/:creatorId/earnings", authenticateToken, async (req, res) => 
         // Query earnings data
         const earningsQuery = `
             SELECT 
-                COALESCE(SUM(CASE WHEN t.type = 'subscription' AND t.status = 'completed' THEN t.amount ELSE 0 END), 0) AS total_earnings,
-                COALESCE(SUM(CASE WHEN t.type = 'subscription' AND t.status = 'completed' AND NOT EXISTS (
+                COALESCE(SUM(CASE WHEN (t.type = 'subscription' OR t.type = 'referral_commission') AND t.status = 'completed' THEN t.amount ELSE 0 END), 0) AS total_earnings,
+                COALESCE(SUM(CASE WHEN (t.type = 'subscription' OR t.type = 'referral_commission') AND t.status = 'completed' AND NOT EXISTS (
                     SELECT 1 FROM transactions p WHERE p.type = 'payout' AND p.status = 'completed' AND p.created_at >= t.created_at
                 ) THEN t.amount ELSE 0 END), 0) AS pending_payout,
                 (SELECT t.amount FROM transactions t WHERE t.creator_id = $1 AND t.type = 'payout' AND t.status = 'completed' 
@@ -3243,7 +3243,7 @@ app.post("/creators/:creatorId/payouts/request", authenticateToken, async (req, 
 
         // Check pending payout balance
         const balanceQuery = `
-            SELECT COALESCE(SUM(CASE WHEN t.type = 'subscription' AND t.status = 'completed' AND NOT EXISTS (
+            SELECT COALESCE(SUM(CASE WHEN (t.type = 'subscription' OR t.type = 'referral_commission') AND t.status = 'completed' AND NOT EXISTS (
                 SELECT 1 FROM transactions p WHERE p.type = 'payout' AND p.status = 'completed' AND p.created_at >= t.created_at
             ) THEN t.amount ELSE 0 END), 0) AS pending_payout
             FROM transactions t
