@@ -3241,10 +3241,16 @@ app.post("/creators/:creatorId/payouts/request", authenticateToken, async (req, 
             `SELECT payment_method, payout_threshold, mpesa_phone FROM payout_settings WHERE creator_id = $1`,
             [creatorId]
         );
-        const settings = settingsResult.rows[0] || { payout_threshold: 50, payment_method: 'mpesa', mpesa_phone: null };
+        const settings = settingsResult.rows[0] || { payout_threshold: 1, payment_method: 'mpesa', mpesa_phone: null };
         if (parsedAmount < settings.payout_threshold) {
             console.error(`Payout amount ${parsedAmount} below threshold ${settings.payout_threshold}`);
             return res.status(400).json({ error: `Payout amount must be at least KES ${settings.payout_threshold}` });
+        }
+
+        const mpesaMinimum = parseInt(process.env.MPESA_B2C_MINIMUM_AMOUNT || '1', 10);
+        if (settings.payment_method === 'mpesa' && parsedAmount < mpesaMinimum) {
+            console.error(`Payout amount ${parsedAmount} below M-Pesa minimum ${mpesaMinimum}`);
+            return res.status(400).json({ error: `M-Pesa payouts require a minimum amount of KES ${mpesaMinimum}` });
         }
 
         // Check pending payout balance
@@ -3361,7 +3367,7 @@ app.post("/creators/:creatorId/payouts/request", authenticateToken, async (req, 
 app.post("/api/mpesa/b2c_callback", async (req, res) => {
     try {
         console.log('📥 Received B2C callback:', JSON.stringify(req.body, null, 2));
-        const result = req.body.Body?.Result;
+        const result = req.body.Body?.Result || req.body.Result;
         if (!result || typeof result.ResultCode === 'undefined') {
             console.error("Invalid B2C callback structure:", JSON.stringify(req.body, null, 2));
             return res.status(400).json({ error: "Invalid callback data" });
