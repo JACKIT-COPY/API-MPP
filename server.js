@@ -978,8 +978,20 @@ app.post("/api/mpesa/callback", async (req, res) => {
         );
 
         if (subResult.rowCount === 0) {
-            console.error("❌ No matching subscription found for CheckoutRequestID:", CheckoutRequestID);
-            return res.status(404).json({ error: "Subscription not found for this transaction" });
+            console.log("ℹ️ No matching subscription found; checking for credit purchase transaction...");
+            const creditResult = await pool.query(
+                `SELECT id, creator_id, description FROM transactions WHERE transaction_id = $1 AND type = 'credit_purchase' AND status = 'pending'`,
+                [CheckoutRequestID]
+            );
+
+            if (creditResult.rowCount > 0) {
+                const purchase = creditResult.rows[0];
+                await processCreditPurchaseCallback(purchase, ResultCode, transactionId, CheckoutRequestID);
+                return res.sendStatus(200);
+            }
+
+            console.error("❌ No matching subscription or credit purchase found for CheckoutRequestID:", CheckoutRequestID);
+            return res.status(404).json({ error: "Transaction not found for this CheckoutRequestID" });
         }
 
         const subscriptionId = subResult.rows[0].id;
@@ -4252,7 +4264,14 @@ app.patch("/api/credits/onboarding", authenticateToken, async (req, res) => {
 app.post("/api/credits/purchase", authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
-        const { packageId, phoneNumber } = req.body;
+        const { packageId } = req.body;
+        let phoneNumber = String(req.body.phoneNumber || '').trim();
+
+        if (/^\+254\d{9}$/.test(phoneNumber)) {
+            phoneNumber = phoneNumber.substring(1);
+        } else if (/^0\d{9}$/.test(phoneNumber)) {
+            phoneNumber = '254' + phoneNumber.substring(1);
+        }
         
         const pkg = CREDIT_PACKAGES.find(p => p.id === packageId);
         if (!pkg) return res.status(400).json({ error: "Invalid package" });
@@ -4307,6 +4326,15 @@ app.post("/api/credits/purchase", authenticateToken, async (req, res) => {
         const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
         const password = Buffer.from(`${process.env.PAYBILL_NUMBER}${process.env.PASSKEY}${timestamp}`).toString('base64');
         
+        const callbackUrl = process.env.MPESA_CREDIT_CALLBACK_URL || (
+            process.env.MPESA_CALLBACK_URL
+                ? `${process.env.MPESA_CALLBACK_URL.replace(/\/$/, '')}_credits`
+                : null
+        );
+        if (!callbackUrl) {
+            return res.status(500).json({ error: "Credit callback URL is not configured" });
+        }
+
         const stkResponse = await axios.post(
             process.env.MPESA_ENV === 'production'
                 ? 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest'
@@ -4320,7 +4348,7 @@ app.post("/api/credits/purchase", authenticateToken, async (req, res) => {
                 PartyA: phoneNumber,
                 PartyB: process.env.PAYBILL_NUMBER,
                 PhoneNumber: phoneNumber,
-                CallBackURL: `${process.env.MPESA_CALLBACK_URL}_credits`,
+                CallBackURL: callbackUrl,
                 AccountReference: `MPP_Credits_${userId}_${packageId}`,
                 TransactionDesc: `MyPaidPost Credit Purchase: ${pkg.name}`
             },
@@ -4348,6 +4376,34 @@ app.post("/api/credits/purchase", authenticateToken, async (req, res) => {
     }
 });
 
+async function processCreditPurchaseCallback(trans, ResultCode, transactionMpesaId, CheckoutRequestID) {
+    const status = ResultCode === 0 ? 'completed' : 'failed';
+
+    await pool.query(
+        `UPDATE transactions SET status = $1, transaction_id = $2 WHERE id = $3`,
+        [status, transactionMpesaId || CheckoutRequestID, trans.id]
+    );
+
+    if (status === 'completed') {
+        const match = trans.description.match(/(\d+) credits/);
+        const bonusMatch = trans.description.match(/\+ (\d+) bonus/);
+        const baseCredits = match ? parseInt(match[1], 10) : 0;
+        const bonusCredits = bonusMatch ? parseInt(bonusMatch[1], 10) : 0;
+        const totalCredits = baseCredits + bonusCredits;
+
+        await pool.query(
+            `UPDATE users SET credits = credits + $1 WHERE id = $2`,
+            [totalCredits, trans.creator_id]
+        );
+
+        await pool.query(
+            `INSERT INTO credit_transactions (user_id, amount, type, description, expires_at)
+             VALUES ($1, $2, 'purchase', $3, NOW() + INTERVAL '90 days')`,
+            [trans.creator_id, totalCredits, `Purchased ${baseCredits} credits${bonusCredits > 0 ? ` + ${bonusCredits} bonus` : ''}`]
+        );
+    }
+}
+
 // Credit purchase callback (M-Pesa)
 app.post("/api/mpesa/callback_credits", async (req, res) => {
     try {
@@ -4364,35 +4420,7 @@ app.post("/api/mpesa/callback_credits", async (req, res) => {
         if (transResult.rowCount === 0) return res.status(404).json({ error: "Transaction not found" });
         
         const trans = transResult.rows[0];
-        const status = ResultCode === 0 ? 'completed' : 'failed';
-        
-        await pool.query(
-            `UPDATE transactions SET status = $1, transaction_id = $2 WHERE id = $3`,
-            [status, transactionMpesaId || CheckoutRequestID, trans.id]
-        );
-        
-        if (status === 'completed') {
-            // Parse credits from description
-            const match = trans.description.match(/(\d+) credits/);
-            const bonusMatch = trans.description.match(/\+ (\d+) bonus/);
-            const baseCredits = match ? parseInt(match[1]) : 0;
-            const bonusCredits = bonusMatch ? parseInt(bonusMatch[1]) : 0;
-            const totalCredits = baseCredits + bonusCredits;
-            
-            // Add credits to user
-            await pool.query(
-                `UPDATE users SET credits = credits + $1 WHERE id = $2`,
-                [totalCredits, trans.creator_id]
-            );
-            
-            // Log credit transaction
-            await pool.query(
-                `INSERT INTO credit_transactions (user_id, amount, type, description, expires_at)
-                 VALUES ($1, $2, 'purchase', $3, NOW() + INTERVAL '90 days')`,
-                [trans.creator_id, totalCredits, `Purchased ${baseCredits} credits${bonusCredits > 0 ? ` + ${bonusCredits} bonus` : ''}`]
-            );
-        }
-        
+        await processCreditPurchaseCallback(trans, ResultCode, transactionMpesaId, CheckoutRequestID);
         res.sendStatus(200);
     } catch (error) {
         console.error("Credit callback error:", error);
