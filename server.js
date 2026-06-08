@@ -4376,6 +4376,30 @@ app.post("/api/credits/purchase", authenticateToken, async (req, res) => {
     }
 });
 
+app.get("/api/credits/purchase/status", authenticateToken, async (req, res) => {
+    try {
+        const { checkoutRequestId } = req.query;
+        if (!checkoutRequestId) {
+            return res.status(400).json({ error: "Missing checkoutRequestId" });
+        }
+
+        const statusResult = await pool.query(
+            `SELECT status, description FROM transactions WHERE transaction_id = $1 AND type = 'credit_purchase'`,
+            [checkoutRequestId]
+        );
+
+        if (statusResult.rowCount === 0) {
+            return res.status(404).json({ error: "Credit purchase not found" });
+        }
+
+        const { status, description } = statusResult.rows[0];
+        res.json({ status, description });
+    } catch (err) {
+        console.error("Credit purchase status error:", err);
+        res.status(500).json({ error: "Failed to retrieve purchase status" });
+    }
+});
+
 async function processCreditPurchaseCallback(trans, ResultCode, transactionMpesaId, CheckoutRequestID) {
     const status = ResultCode === 0 ? 'completed' : 'failed';
 
