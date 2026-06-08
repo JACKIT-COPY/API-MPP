@@ -3146,6 +3146,10 @@ app.get("/creators/:creatorId/earnings", authenticateToken, async (req, res) => 
                 COALESCE(SUM(CASE WHEN (t.type = 'subscription' OR t.type = 'referral_commission') AND t.status = 'completed' AND NOT EXISTS (
                     SELECT 1 FROM transactions p WHERE p.type = 'payout' AND p.status = 'completed' AND p.created_at >= t.created_at
                 ) THEN t.amount ELSE 0 END), 0) AS pending_payout,
+                COALESCE(SUM(CASE WHEN t.type = 'referral_commission' AND t.status = 'completed' THEN t.amount ELSE 0 END), 0) AS total_referral_earnings,
+                COALESCE(SUM(CASE WHEN t.type = 'referral_commission' AND t.status = 'completed' AND NOT EXISTS (
+                    SELECT 1 FROM transactions p WHERE p.type = 'payout' AND p.status = 'completed' AND p.created_at >= t.created_at
+                ) THEN t.amount ELSE 0 END), 0) AS pending_referral_payout,
                 (SELECT t.amount FROM transactions t WHERE t.creator_id = $1 AND t.type = 'payout' AND t.status = 'completed' 
                  ORDER BY t.created_at DESC LIMIT 1) AS last_payout,
                 (SELECT t.created_at FROM transactions t WHERE t.creator_id = $1 AND t.type = 'payout' AND t.status = 'completed' 
@@ -3174,6 +3178,8 @@ app.get("/creators/:creatorId/earnings", authenticateToken, async (req, res) => 
         const response = {
             totalEarnings: parseFloat(earningsResult.rows[0].total_earnings) || 0,
             pendingPayout: parseFloat(earningsResult.rows[0].pending_payout) || 0,
+            totalReferralEarnings: parseFloat(earningsResult.rows[0].total_referral_earnings) || 0,
+            pendingReferralPayout: parseFloat(earningsResult.rows[0].pending_referral_payout) || 0,
             lastPayout: parseFloat(earningsResult.rows[0].last_payout) || 0,
             lastPayoutDate: earningsResult.rows[0].last_payout_date ? earningsResult.rows[0].last_payout_date.toISOString() : null,
             transactions: transactionsResult.rows.map(t => ({
