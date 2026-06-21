@@ -4102,6 +4102,36 @@ app.get("/api/referrals/info", async (req, res) => {
     });
 });
 
+// Get referral leaderboard for current month
+app.get("/api/referrals/leaderboard", async (req, res) => {
+    try {
+        const query = `
+            SELECT 
+                r.name, 
+                COUNT(u.id) as referral_count
+            FROM users r
+            JOIN users u ON u.referred_by = r.id
+            WHERE date_trunc('month', u.created_at) = date_trunc('month', CURRENT_DATE)
+            GROUP BY r.id, r.name
+            ORDER BY referral_count DESC
+            LIMIT 20
+        `;
+        const result = await pool.query(query);
+        
+        // Format names
+        const leaderboard = result.rows.map((row, index) => ({
+            rank: index + 1,
+            name: row.name || 'Anonymous Creator',
+            count: parseInt(row.referral_count, 10)
+        }));
+        
+        res.json(leaderboard);
+    } catch (error) {
+        console.error("Referral leaderboard error:", error);
+        res.status(500).json({ error: "Failed to fetch referral leaderboard" });
+    }
+});
+
 // ========== REQ-11: Credit System Endpoints ==========
 
 const CREDIT_PACKAGES = [
