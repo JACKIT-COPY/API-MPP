@@ -5353,15 +5353,17 @@ app.get("/api/following/posts", authenticateToken, async (req, res) => {
 // GET /api/creators/:creatorId/followers - Who follows this creator
 app.get("/api/creators/:creatorId/followers", authenticateToken, async (req, res) => {
     const creatorId = parseInt(req.params.creatorId);
+    const currentUserId = req.user.id;
     try {
         const result = await pool.query(`
-            SELECT u.id, u.name, cp.profile_image AS avatar_url, cp.bio
+            SELECT u.id, u.name, cp.profile_image AS avatar_url, cp.bio,
+                   EXISTS(SELECT 1 FROM followers WHERE follower_id = $2 AND following_id = u.id) AS is_following
             FROM followers f
             JOIN users u ON f.follower_id = u.id
             LEFT JOIN creators_page cp ON u.id = cp.user_id
             WHERE f.following_id = $1
             ORDER BY f.created_at DESC
-        `, [creatorId]);
+        `, [creatorId, currentUserId]);
         res.json(result.rows);
     } catch (error) {
         console.error("Fetch creator followers error:", error);
@@ -5372,15 +5374,17 @@ app.get("/api/creators/:creatorId/followers", authenticateToken, async (req, res
 // GET /api/creators/:creatorId/following - Who this creator follows
 app.get("/api/creators/:creatorId/following", authenticateToken, async (req, res) => {
     const creatorId = parseInt(req.params.creatorId);
+    const currentUserId = req.user.id;
     try {
         const result = await pool.query(`
-            SELECT u.id, u.name, cp.profile_image AS avatar_url, cp.bio
+            SELECT u.id, u.name, cp.profile_image AS avatar_url, cp.bio,
+                   EXISTS(SELECT 1 FROM followers WHERE follower_id = $2 AND following_id = u.id) AS is_following
             FROM followers f
             JOIN users u ON f.following_id = u.id
             LEFT JOIN creators_page cp ON u.id = cp.user_id
             WHERE f.follower_id = $1
             ORDER BY f.created_at DESC
-        `, [creatorId]);
+        `, [creatorId, currentUserId]);
         res.json(result.rows);
     } catch (error) {
         console.error("Fetch creator following error:", error);
