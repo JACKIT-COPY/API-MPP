@@ -575,6 +575,37 @@ pool.query(`
     `).then(() => console.log("Followers indexes ready"))
       .catch(err => console.error("Error creating followers indexes:", err));
 
+    // Live Sessions table
+    pool.query(`
+        CREATE TABLE IF NOT EXISTS live_sessions (
+            id VARCHAR(50) PRIMARY KEY,
+            creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            title VARCHAR(255) NOT NULL,
+            description TEXT,
+            status VARCHAR(20) DEFAULT 'active',
+            started_at TIMESTAMP DEFAULT NOW(),
+            ended_at TIMESTAMP,
+            viewers INTEGER DEFAULT 0,
+            peak_viewers INTEGER DEFAULT 0,
+            credits_used INTEGER DEFAULT 0,
+            total_donations INTEGER DEFAULT 0
+        )
+    `).then(() => console.log("Live sessions table ready"))
+      .catch(err => console.error("Error creating live_sessions table:", err));
+
+    // Live Donations table
+    pool.query(`
+        CREATE TABLE IF NOT EXISTS live_donations (
+            id SERIAL PRIMARY KEY,
+            session_id VARCHAR(50) REFERENCES live_sessions(id) ON DELETE CASCADE,
+            donor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            amount INTEGER NOT NULL,
+            message TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    `).then(() => console.log("Live donations table ready"))
+      .catch(err => console.error("Error creating live_donations table:", err));
+
 });
 
 // Middleware to verify JWT
@@ -5126,6 +5157,189 @@ cron.schedule('0 21 1 * *', async () => {
         console.log(`✅ Monthly badge disbursement complete: ${creators.rowCount} creators processed`);
     } catch (error) {
         console.error('❌ Monthly badge cron error:', error);
+    }
+});
+
+// ==========================================
+// LIVE SESSIONS API
+// ==========================================
+
+// In-memory chat mock
+const activeLiveChats = new Map(); // sessionId -> array of chat messages
+
+app.post('/api/live/start', authenticateToken, async (req, res) => {
+    const { title, description } = req.body;
+    const sessionId = 'live_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+    
+    try {
+        await pool.query(`
+            INSERT INTO live_sessions (id, creator_id, title, description)
+            VALUES ($1, $2, $3, $4)
+        `, [sessionId, req.user.id, title, description]);
+        
+        activeLiveChats.set(sessionId, []);
+        
+        res.json({ sessionId, status: 'active' });
+    } catch (error) {
+        console.error('Start live session error:', error);
+        res.status(500).json({ error: 'Failed to start live session' });
+    }
+});
+
+app.post('/api/live/deduct-credits', authenticateToken, async (req, res) => {
+    const { sessionId, amount, minute } = req.body;
+    try {
+        // Deduct credits from user
+        const updateRes = await pool.query(`
+            UPDATE users 
+            SET credits = GREATEST(0, credits - $1)
+            WHERE id = $2 AND credits >= $1
+            RETURNING credits
+        `, [amount, req.user.id]);
+        
+        if (updateRes.rowCount === 0) {
+            return res.status(400).json({ error: 'Insufficient credits' });
+        }
+        
+        // Log in credit_transactions
+        await pool.query(`
+            INSERT INTO credit_transactions (user_id, amount, type, description)
+            VALUES ($1, $2, 'live_session', $3)
+        `, [req.user.id, -amount, `Live session billing for minute ${minute}`]);
+        
+        // Update session credits_used
+        await pool.query(`
+            UPDATE live_sessions 
+            SET credits_used = credits_used + $1 
+            WHERE id = $2
+        `, [amount, sessionId]);
+        
+        res.json({ success: true, remaining: updateRes.rows[0].credits });
+    } catch (error) {
+        console.error('Live deduct error:', error);
+        res.status(500).json({ error: 'Failed to deduct credits' });
+    }
+});
+
+app.post('/api/live/end', authenticateToken, async (req, res) => {
+    const { sessionId, durationSeconds, creditsUsed } = req.body;
+    try {
+        await pool.query(`
+            UPDATE live_sessions 
+            SET status = 'ended', ended_at = NOW() 
+            WHERE id = $1 AND creator_id = $2
+        `, [sessionId, req.user.id]);
+        
+        // Cleanup chat memory
+        activeLiveChats.delete(sessionId);
+        
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Live end error:', error);
+        res.status(500).json({ error: 'Failed to end live session' });
+    }
+});
+
+app.post('/api/live/chat', authenticateToken, async (req, res) => {
+    const { sessionId, message } = req.body;
+    if (!activeLiveChats.has(sessionId)) {
+        activeLiveChats.set(sessionId, []);
+    }
+    const chat = activeLiveChats.get(sessionId);
+    chat.push(message);
+    // limit to last 200 messages
+    if (chat.length > 200) chat.shift();
+    res.json({ success: true });
+});
+
+app.post('/api/live/donate', authenticateToken, async (req, res) => {
+    const { sessionId, donation } = req.body;
+    try {
+        await pool.query(`
+            INSERT INTO live_donations (session_id, donor_id, amount, message)
+            VALUES ($1, $2, $3, $4)
+        `, [sessionId, req.user.id, donation.amount, donation.message]);
+        
+        await pool.query(`
+            UPDATE live_sessions 
+            SET total_donations = total_donations + $1 
+            WHERE id = $2
+        `, [donation.amount, sessionId]);
+        
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Live donate error:', error);
+        res.status(500).json({ error: 'Failed to process donation' });
+    }
+});
+
+app.post('/api/live/report', authenticateToken, async (req, res) => {
+    const { sessionId, reason } = req.body;
+    try {
+        console.log(`Report received for session ${sessionId}: ${reason} by user ${req.user.id}`);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Live report error:', error);
+        res.status(500).json({ error: 'Failed to submit report' });
+    }
+});
+
+app.get('/api/live/active', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT ls.id AS "sessionId", ls.title, ls.started_at AS "startedAt", ls.viewers,
+                   u.name AS "hostName", cp.profile_image AS "hostAvatar"
+            FROM live_sessions ls
+            JOIN users u ON ls.creator_id = u.id
+            LEFT JOIN creators_page cp ON ls.creator_id = cp.user_id
+            WHERE ls.status = 'active'
+            ORDER BY ls.viewers DESC
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Live active streams fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch active streams' });
+    }
+});
+
+app.get('/api/live/session/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const result = await pool.query(`
+            SELECT ls.id AS "sessionId", ls.title, ls.started_at AS "startedAt", ls.viewers,
+                   ls.status,
+                   u.name AS "hostName", cp.profile_image AS "hostAvatar"
+            FROM live_sessions ls
+            JOIN users u ON ls.creator_id = u.id
+            LEFT JOIN creators_page cp ON ls.creator_id = cp.user_id
+            WHERE ls.id = $1
+        `, [id]);
+        
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Session not found' });
+        }
+        
+        const session = result.rows[0];
+        session.isLive = session.status === 'active';
+        
+        // Attach chat and donations
+        session.chat = activeLiveChats.get(id) || [];
+        
+        const donResult = await pool.query(`
+            SELECT ld.amount, ld.message, u.name AS "donorName", cp.profile_image AS avatar
+            FROM live_donations ld
+            JOIN users u ON ld.donor_id = u.id
+            LEFT JOIN creators_page cp ON ld.donor_id = cp.user_id
+            WHERE ld.session_id = $1
+            ORDER BY ld.created_at ASC
+        `, [id]);
+        
+        session.donations = donResult.rows;
+        
+        res.json(session);
+    } catch (error) {
+        console.error('Live session fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch session' });
     }
 });
 
