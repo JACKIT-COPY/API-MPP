@@ -5233,6 +5233,11 @@ app.post('/api/live/end', authenticateToken, async (req, res) => {
         // Cleanup chat memory
         activeLiveChats.delete(sessionId);
         
+        // Notify viewers
+        if (global.io) {
+            global.io.to(`live:${sessionId}`).emit('live:ended', { sessionId });
+        }
+        
         res.json({ success: true });
     } catch (error) {
         console.error('Live end error:', error);
@@ -5249,6 +5254,12 @@ app.post('/api/live/chat', authenticateToken, async (req, res) => {
     chat.push(message);
     // limit to last 200 messages
     if (chat.length > 200) chat.shift();
+    
+    // Broadcast to live room
+    if (global.io) {
+        global.io.to(`live:${sessionId}`).emit('live:chat', message);
+    }
+    
     res.json({ success: true });
 });
 
@@ -5265,6 +5276,11 @@ app.post('/api/live/donate', authenticateToken, async (req, res) => {
             SET total_donations = total_donations + $1 
             WHERE id = $2
         `, [donation.amount, sessionId]);
+        
+        // Broadcast to live room
+        if (global.io) {
+            global.io.to(`live:${sessionId}`).emit('live:donation', donation);
+        }
         
         res.json({ success: true });
     } catch (error) {
@@ -5352,6 +5368,8 @@ const server = require('http').createServer(app);
 const io = new Server(server, {
     cors: { origin: '*' }  // Adjust for production (e.g., your frontend URL)
 });
+global.io = io; // Expose io instance to REST routes
+
 server.listen(port, () => console.log(`🚀 Server running on port ${port}`));
 
 // Add this before io setup
@@ -5445,6 +5463,83 @@ io.on('connection', (socket) => {
     // Join conversation room (called from frontend on chat open)
     socket.on('join:conversation', ({ conversationId }) => {
         socket.join(`conversation:${conversationId}`);
+    });
+
+    // ==========================================
+    // LIVE SESSIONS SIGNALING & REAL-TIME
+    // ==========================================
+
+    socket.on('live:join', async ({ sessionId }) => {
+        socket.join(`live:${sessionId}`);
+        
+        // Count viewers in room
+        const room = io.sockets.adapter.rooms.get(`live:${sessionId}`);
+        // Subtract 1 if the host is also in the room, but simply using room.size is fine for MVP
+        const viewerCount = room ? room.size : 0;
+        
+        // Update DB
+        try {
+            await pool.query(`UPDATE live_sessions SET viewers = $1 WHERE id = $2`, [viewerCount, sessionId]);
+        } catch(e) { console.error("Error updating viewer count", e); }
+        
+        io.to(`live:${sessionId}`).emit('live:viewer_count_update', { viewers: viewerCount });
+        
+        // Emit to host that a new viewer joined so host can offer WebRTC connection
+        socket.to(`live:${sessionId}`).emit('live:viewer_joined', { socketId: socket.id, userId: socket.user.id });
+    });
+
+    socket.on('live:leave', async ({ sessionId }) => {
+        socket.leave(`live:${sessionId}`);
+        const room = io.sockets.adapter.rooms.get(`live:${sessionId}`);
+        const viewerCount = room ? room.size : 0;
+        
+        try {
+            await pool.query(`UPDATE live_sessions SET viewers = $1 WHERE id = $2`, [viewerCount, sessionId]);
+        } catch(e) { console.error("Error updating viewer count", e); }
+        
+        io.to(`live:${sessionId}`).emit('live:viewer_count_update', { viewers: viewerCount });
+    });
+
+    // Disconnect handling to update viewer counts if they don't explicitly leave
+    socket.on('disconnecting', () => {
+        // Iterate through rooms user was in, if it's a live room, emit count update
+        for (const roomName of socket.rooms) {
+            if (roomName.startsWith('live:')) {
+                const sessionId = roomName.split(':')[1];
+                const room = io.sockets.adapter.rooms.get(roomName);
+                const viewerCount = room ? room.size - 1 : 0; // subtract 1 for the disconnecting user
+                
+                io.to(roomName).emit('live:viewer_count_update', { viewers: viewerCount });
+            }
+        }
+    });
+
+    // WebRTC Signaling
+    socket.on('stream:offer', ({ targetSocketId, offer, sessionId }) => {
+        // Host sends offer to a specific viewer
+        io.to(targetSocketId).emit('stream:offer', {
+            hostSocketId: socket.id,
+            offer,
+            sessionId
+        });
+    });
+
+    socket.on('stream:answer', ({ targetSocketId, answer, sessionId }) => {
+        // Viewer sends answer back to Host
+        io.to(targetSocketId).emit('stream:answer', {
+            viewerSocketId: socket.id,
+            answer,
+            sessionId
+        });
+    });
+
+    socket.on('stream:ice-candidate', ({ targetSocketId, candidate, sessionId }) => {
+        // Relay ICE candidates
+        io.to(targetSocketId).emit('stream:ice-candidate', {
+            senderSocketId: socket.id,
+            candidate,
+            sessionId
+        });
     });
 });
 
