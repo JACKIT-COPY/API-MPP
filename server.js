@@ -610,15 +610,17 @@ pool.query(`
 
 // Middleware to verify JWT
 const authenticateToken = (req, res, next) => {
-    const token = req.headers.authorization?.split("Bearer ")[1];
+    const authHeader = req.headers.authorization || req.headers.Authorization;
+    const token = authHeader && authHeader.split(" ")[1];
+    
     if (!token) return res.status(401).json({ error: "No token provided" });
     try {
         const decoded = jwt.verify(token, secretKey);
         req.user = decoded;
         next();
     } catch (error) {
-        console.error("Token verification error:", error);
-        res.status(401).json({ error: "Invalid token" });
+        console.error("Token verification error:", error.message);
+        res.status(401).json({ error: "Invalid token", details: error.message });
     }
 };
 
@@ -5300,7 +5302,7 @@ app.post('/api/live/report', authenticateToken, async (req, res) => {
     }
 });
 
-app.get('/api/live/active', async (req, res) => {
+app.get(['/api/live/active', '/live/active'], async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT ls.id AS "sessionId", ls.title, ls.started_at AS "startedAt", ls.viewers,
