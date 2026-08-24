@@ -18,6 +18,9 @@ const xss = require('xss');  // For sanitizing user input
 
 dotenv.config();
 
+const emailService = require('./emailService');
+emailService.initEmailService();
+
 const app = express();
 const port = process.env.PORT || 3000;
 const secretKey = process.env.JWT_SECRET || "your-secret-key";
@@ -138,6 +141,29 @@ pool.connect((err) => {
         )
     `).then(() => console.log("Users table ready"))
       .catch(err => console.error("Error creating users table:", err));
+
+    // Password resets table
+    pool.query(`
+        CREATE TABLE IF NOT EXISTS password_resets (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            token VARCHAR(64) UNIQUE NOT NULL,
+            expires_at TIMESTAMP NOT NULL
+        )
+    `).then(() => console.log("Password resets table ready"))
+      .catch(err => console.error("Error creating password resets table:", err));
+
+    // Ensure token has unique constraint (migration for existing databases)
+    pool.query(`
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'password_resets_user_id_key') THEN
+                ALTER TABLE password_resets ADD CONSTRAINT password_resets_user_id_key UNIQUE (user_id);
+            END IF;
+        END
+        $$;
+    `).then(() => console.log("Password resets unique constraint ensured"))
+      .catch(err => console.error("Error ensuring unique constraint:", err));
 
     // Add is_creator column to users if it doesn't exist
     pool.query(`
@@ -1321,6 +1347,9 @@ app.post("/signup", async (req, res) => {
 
         const user = userResult.rows[0];
 
+        // Send welcome email
+        await emailService.sendWelcomeEmail(email, name);
+
         // 2. Automatically create creators_page entry
         await pool.query(
             `INSERT INTO creators_page (user_id, profile_image, bio, socials, updated_at)
@@ -1419,6 +1448,86 @@ app.post("/login", async (req, res) => {
     } catch (error) {
         console.error("Login error:", error);
         res.status(500).json({ error: "Server error", details: error.message });
+    }
+});
+
+// Forgot Password
+app.post("/forgot-password", async (req, res) => {
+    const { email } = req.body;
+    console.log(`[Forgot Password] Request received for email: ${email}`);
+    try {
+        const result = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+        const user = result.rows[0];
+        if (!user) {
+            console.log(`[Forgot Password] No user found for email: ${email}`);
+            // Don't reveal if email exists or not for security
+            return res.status(200).json({ message: "If an account with that email exists, a password reset link has been sent." });
+        }
+
+        console.log(`[Forgot Password] User found: ${user.email}, generating reset token`);
+
+        // Generate reset token
+        const resetToken = crypto.randomBytes(32).toString('hex');
+
+        // Store reset token with expiry (1 hour)
+        const expiry = new Date();
+        expiry.setHours(expiry.getHours() + 1);
+
+        await pool.query(
+            `INSERT INTO password_resets (user_id, token, expires_at) VALUES ($1, $2, $3)
+             ON CONFLICT (user_id) DO UPDATE SET token = $2, expires_at = $3`,
+            [user.id, resetToken, expiry]
+        );
+
+        console.log(`[Forgot Password] Reset token generated and stored for user ${user.id}`);
+
+        // Send reset email
+        await emailService.sendPasswordResetEmail(email, resetToken);
+
+        console.log(`[Forgot Password] Password reset email sent to: ${email}`);
+
+        res.status(200).json({ message: "If an account with that email exists, a password reset link has been sent." });
+    } catch (error) {
+        console.error("Forgot password error:", error);
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+// Reset Password
+app.post("/api/auth/reset-password", async (req, res) => {
+    const { token, newPassword } = req.body;
+    console.log(`[Reset Password] Request received with token: ${token.substring(0, 8)}...`);
+    try {
+        const result = await pool.query("SELECT * FROM password_resets WHERE token = $1 AND expires_at > NOW()", [token]);
+        if (result.rowCount === 0) {
+            console.log(`[Reset Password] Invalid or expired token`);
+            return res.status(400).json({ error: "Invalid or expired reset token" });
+        }
+
+        const userId = result.rows[0].user_id;
+        console.log(`[Reset Password] Token valid, user ID: ${userId}`);
+
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+        await pool.query(
+            `UPDATE users SET password = $1 WHERE id = $2`,
+            [hashedPassword, userId]
+        );
+
+        console.log(`[Reset Password] Password updated for user ${userId}`);
+
+        // Delete used reset token
+        await pool.query(
+            `DELETE FROM password_resets WHERE token = $1`,
+            [token]
+        );
+
+        console.log(`[Reset Password] Reset token deleted`);
+
+        res.status(200).json({ message: "Password has been reset successfully. You can now log in with your new password." });
+    } catch (error) {
+        console.error("Reset password error:", error);
+        res.status(500).json({ error: "Server error" });
     }
 });
 
