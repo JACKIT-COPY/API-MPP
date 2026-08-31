@@ -572,13 +572,13 @@ pool.query(`
 `).then(() => console.log("Retention cohorts table ready"))
   .catch(err => console.error("Error creating retention_cohorts table:", err));
 
-// Update transactions type constraint to support new types
+// Update transactions type constraint to support new types (incl. co-hosting)
 pool.query(`
     ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_type_check
 `).then(() => {
     return pool.query(`
         ALTER TABLE transactions ADD CONSTRAINT transactions_type_check
-        CHECK (type IN ('subscription', 'payout', 'referral_commission', 'referral_fee', 'platform_fee', 'credit_purchase', 'reactivation_fee', 'badge_reward'))
+        CHECK (type IN ('subscription', 'payout', 'referral_commission', 'referral_fee', 'platform_fee', 'credit_purchase', 'reactivation_fee', 'badge_reward', 'cohost_payment', 'cohost_refund', 'cohost_host_earning', 'cohost_referrer_earning', 'cohost_platform_fee', 'escrow_deposit', 'escrow_release'))
     `);
 }).then(() => console.log("Transactions type constraint updated"))
   .catch(err => console.error("Error updating transactions type constraint:", err));
@@ -631,6 +631,161 @@ pool.query(`
         )
     `).then(() => console.log("Live donations table ready"))
       .catch(err => console.error("Error creating live_donations table:", err));
+
+// ===== CO-HOSTING TABLES =====
+
+// Co-Host Settings table — stores whether a creator has co-hosting enabled and their price
+pool.query(`
+    CREATE TABLE IF NOT EXISTS cohost_settings (
+        creator_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        enabled BOOLEAN DEFAULT FALSE,
+        price INTEGER NOT NULL DEFAULT 299 CHECK (price >= 299),
+        max_daily_posts INTEGER DEFAULT 10,
+        description TEXT,
+        updated_at TIMESTAMP DEFAULT NOW()
+    )
+`).then(() => console.log("Co-host settings table ready"))
+  .catch(err => console.error("Error creating cohost_settings table:", err));
+
+// Co-Host Requests table — tracks co-post requests from Guest to Host
+pool.query(`
+    CREATE TABLE IF NOT EXISTS cohost_requests (
+        id SERIAL PRIMARY KEY,
+        guest_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        host_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'expired', 'published')),
+        price INTEGER NOT NULL,
+        payment_method VARCHAR(20),
+        payment_status VARCHAR(20) DEFAULT 'pending' CHECK (payment_status IN ('pending', 'held', 'completed', 'refunded', 'failed')),
+        mpesa_transaction_id VARCHAR(50),
+        post_title VARCHAR(255),
+        post_caption TEXT,
+        post_type VARCHAR(50) DEFAULT 'text',
+        post_images JSONB DEFAULT '[]',
+        post_video_url TEXT,
+        post_audio_url TEXT,
+        post_tags TEXT[] DEFAULT '{}',
+        submitted_at TIMESTAMP DEFAULT NOW(),
+        reviewed_at TIMESTAMP,
+        expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '24 hours'),
+        created_at TIMESTAMP DEFAULT NOW()
+    )
+`).then(() => {
+    console.log("Co-host requests table ready");
+    return pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_cohost_requests_host ON cohost_requests(host_id);
+        CREATE INDEX IF NOT EXISTS idx_cohost_requests_guest ON cohost_requests(guest_id);
+        CREATE INDEX IF NOT EXISTS idx_cohost_requests_status ON cohost_requests(status);
+    `);
+}).then(() => console.log("Co-host requests indexes ready"))
+  .catch(err => console.error("Error creating cohost_requests table/indexes:", err));
+
+// Notifications table — persistent notification system
+pool.query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(50) NOT NULL,
+        title VARCHAR(255),
+        message TEXT,
+        data JSONB DEFAULT '{}',
+        read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+    )
+`).then(() => {
+    console.log("Notifications table ready");
+    return pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+        CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(user_id, read);
+    `);
+}).then(() => console.log("Notifications indexes ready"))
+  .catch(err => console.error("Error creating notifications table/indexes:", err));
+
+// Add co-post columns to posts table
+pool.query(`
+    ALTER TABLE posts
+    ADD COLUMN IF NOT EXISTS is_copost BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS cohost_request_id INTEGER,
+    ADD COLUMN IF NOT EXISTS cohost_host_id INTEGER
+`).then(() => console.log("Posts table co-host columns ready"))
+  .catch(err => console.error("Error adding co-host columns to posts:", err));
+
+// Add account_type column to users table (for business accounts)
+pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS account_type VARCHAR(20) DEFAULT 'creator'
+`).then(() => console.log("Users table account_type column ready"))
+  .catch(err => console.error("Error adding account_type to users:", err));
+
+// Business Profiles table
+pool.query(`
+    CREATE TABLE IF NOT EXISTS business_profiles (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        company_name VARCHAR(255),
+        industry VARCHAR(100),
+        website VARCHAR(255),
+        logo_url TEXT,
+        description TEXT,
+        verified BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+    )
+`).then(() => console.log("Business profiles table ready"))
+  .catch(err => console.error("Error creating business_profiles table:", err));
+
+// Campaigns & Escrow tables
+pool.query(`
+    CREATE TABLE IF NOT EXISTS campaigns (
+        id SERIAL PRIMARY KEY,
+        business_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        description TEXT NOT NULL,
+        budget INTEGER NOT NULL CHECK (budget > 0),
+        deliverables TEXT,
+        deadline TIMESTAMP,
+        status VARCHAR(20) DEFAULT 'open' CHECK (status IN ('open', 'in_progress', 'completed', 'cancelled')),
+        escrow_amount INTEGER DEFAULT 0,
+        escrow_status VARCHAR(20) DEFAULT 'none' CHECK (escrow_status IN ('none', 'deposited', 'released', 'refunded')),
+        payment_method VARCHAR(20),
+        mpesa_transaction_id VARCHAR(50),
+        selected_proposal_id INTEGER,
+        created_at TIMESTAMP DEFAULT NOW()
+    )
+`).then(() => {
+    console.log("Campaigns table ready");
+    return pool.query(`
+        CREATE TABLE IF NOT EXISTS campaign_proposals (
+            id SERIAL PRIMARY KEY,
+            campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+            creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            content_sample TEXT,
+            pitch TEXT,
+            proposed_price INTEGER,
+            status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'rejected', 'delivered', 'completed')),
+            credits_spent INTEGER DEFAULT 5,
+            submitted_at TIMESTAMP DEFAULT NOW(),
+            reviewed_at TIMESTAMP,
+            delivered_at TIMESTAMP,
+            delivery_notes TEXT,
+            post_id INTEGER REFERENCES posts(id) ON DELETE SET NULL,
+            UNIQUE(campaign_id, creator_id)
+        )
+    `);
+}).then(() => {
+    console.log("Campaign proposals table ready");
+    return pool.query(`
+        CREATE TABLE IF NOT EXISTS campaign_ratings (
+            id SERIAL PRIMARY KEY,
+            campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+            rater_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            rated_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+            review TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(campaign_id, rater_id, rated_id)
+        )
+    `);
+}).then(() => console.log("Campaign ratings table ready"))
+  .catch(err => console.error("Error creating campaigns/proposals/ratings tables:", err));
 
 });
 
@@ -1049,7 +1204,35 @@ app.post("/api/mpesa/callback", async (req, res) => {
                 return res.sendStatus(200);
             }
 
-            console.error("❌ No matching subscription or credit purchase found for CheckoutRequestID:", CheckoutRequestID);
+            // Check for pending campaign escrow deposit
+            const campaignRes = await pool.query(
+                `SELECT id, business_id, title, budget FROM campaigns WHERE mpesa_transaction_id = $1`,
+                [CheckoutRequestID]
+            );
+            if (campaignRes.rowCount > 0) {
+                const campaign = campaignRes.rows[0];
+                if (ResultCode === 0) {
+                    await pool.query(
+                        `UPDATE campaigns SET status = 'open', escrow_status = 'deposited', mpesa_receipt_number = $1 WHERE id = $2`,
+                        [transactionId || CheckoutRequestID, campaign.id]
+                    );
+                    await pool.query(
+                        `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+                         VALUES ($1, 'escrow_deposit', $2, 'completed', $3, $4)`,
+                        [campaign.business_id, -campaign.budget, transactionId || CheckoutRequestID, `Escrow deposit for campaign #${campaign.id}: ${campaign.title}`]
+                    );
+                    console.log(`✅ Escrow deposit confirmed for campaign #${campaign.id}`);
+                } else {
+                    await pool.query(
+                        `UPDATE campaigns SET status = 'cancelled', escrow_status = 'deposit_failed' WHERE id = $1`,
+                        [campaign.id]
+                    );
+                    console.log(`❌ Escrow deposit failed for campaign #${campaign.id}`);
+                }
+                return res.sendStatus(200);
+            }
+
+            console.error("❌ No matching subscription, credit purchase, or campaign escrow found for CheckoutRequestID:", CheckoutRequestID);
             return res.status(404).json({ error: "Transaction not found for this CheckoutRequestID" });
         }
 
@@ -1286,7 +1469,7 @@ app.post("/subscribe", authenticateToken, async (req, res) => {
 
 // Signup
 app.post("/signup", async (req, res) => {
-    const { name, email, password, moderatorId, moderator, role, referralCode } = req.body;
+    const { name, email, password, moderatorId, moderator, role, referralCode, accountType, companyName, industry } = req.body;
 
     try {
         if (!name || !email || !password) {
@@ -1318,6 +1501,7 @@ app.post("/signup", async (req, res) => {
 
         const validRoles = ["user", "moderator", "admin"];
         const finalRole = validRoles.includes(role) ? role : "user";
+        const finalAccountType = accountType === 'business' ? 'business' : 'creator';
 
         const sequenceResult = await pool.query(
             "SELECT nextval('user_moderation_seq') AS seq"
@@ -1332,17 +1516,17 @@ app.post("/signup", async (req, res) => {
             }
         }
 
-        // === START TRANSACTION: Create user + creator profile atomically ===
+        // === START TRANSACTION: Create user + profile atomically ===
         await pool.query("BEGIN");
 
-        // 1. Create user (is_creator defaults to FALSE in table, but we'll set it later)
+        // 1. Create user
         const userResult = await pool.query(
             `INSERT INTO users (
                 name, email, password, moderator_id, moderator, 
-                user_moderation_id, role, is_creator, referred_by
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8)
-             RETURNING id, name, email, moderator_id, moderator, user_moderation_id, role`,
-            [name.trim(), email.toLowerCase(), hashedPassword, finalModeratorId, moderator || '', userModerationId, finalRole, referredBy]
+                user_moderation_id, role, is_creator, referred_by, account_type
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             RETURNING id, name, email, moderator_id, moderator, user_moderation_id, role, account_type`,
+            [name.trim(), email.toLowerCase(), hashedPassword, finalModeratorId, moderator || '', userModerationId, finalRole, finalAccountType === 'creator', referredBy, finalAccountType]
         );
 
         const user = userResult.rows[0];
@@ -1350,20 +1534,31 @@ app.post("/signup", async (req, res) => {
         // Send welcome email
         await emailService.sendWelcomeEmail(email, name);
 
-        // 2. Automatically create creators_page entry
-        await pool.query(
-            `INSERT INTO creators_page (user_id, profile_image, bio, socials, updated_at)
-             VALUES ($1, $2, $3, $4, NOW())
-             ON CONFLICT (user_id) DO NOTHING`,
-            [
-                user.id,
-                `https://placehold.co/400x400?text=${encodeURIComponent(name.charAt(0).toUpperCase())}`,
-                "Hey there! I just joined MyPaidPost",
-                {} // empty socials
-            ]
-        );
+        if (finalAccountType === 'business') {
+            // Create business profile
+            await pool.query(
+                `INSERT INTO business_profiles (user_id, company_name, industry, created_at)
+                 VALUES ($1, $2, $3, NOW())
+                 ON CONFLICT (user_id) DO NOTHING`,
+                [user.id, companyName || name, industry || 'Advertising & Sponsorships']
+            );
+        } else {
+            // 2. Automatically create creators_page entry
+            await pool.query(
+                `INSERT INTO creators_page (user_id, profile_image, bio, socials, updated_at)
+                 VALUES ($1, $2, $3, $4, NOW())
+                 ON CONFLICT (user_id) DO NOTHING`,
+                [
+                    user.id,
+                    `https://placehold.co/400x400?text=${encodeURIComponent(name.charAt(0).toUpperCase())}`,
+                    "Hey there! I just joined MyPaidPost",
+                    {} // empty socials
+                ]
+            );
+        }
 
         // Assign default subscription tiers for new creators if they don't already have any
+        if (finalAccountType !== 'business') {
         try {
             const existingTiers = await pool.query(
                 `SELECT COUNT(*) FROM subscription_tiers WHERE creator_id = $1`,
@@ -1403,6 +1598,7 @@ app.post("/signup", async (req, res) => {
             console.error(`[signup] Failed to assign default subscription tiers for userId=${user.id}:`, tierErr);
             throw tierErr;
         }
+        }
 
         await pool.query("COMMIT");
 
@@ -1434,7 +1630,13 @@ app.post("/signup", async (req, res) => {
 app.post("/login", async (req, res) => {
     const { email, password } = req.body;
     try {
-        const result = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+        const result = await pool.query(
+            `SELECT u.*, bp.company_name, bp.industry, bp.logo_url
+             FROM users u
+             LEFT JOIN business_profiles bp ON u.id = bp.user_id
+             WHERE u.email = $1`,
+            [email.toLowerCase().trim()]
+        );
         const user = result.rows[0];
         if (!user) {
             return res.status(400).json({ error: "Invalid email or password" });
@@ -1443,8 +1645,22 @@ app.post("/login", async (req, res) => {
         if (!validPassword) {
             return res.status(400).json({ error: "Invalid email or password" });
         }
-        const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, secretKey, { expiresIn: "1h" });
-        res.json({ message: "Login successful", token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+        const token = jwt.sign({ id: user.id, email: user.email, role: user.role, accountType: user.account_type || 'creator' }, secretKey, { expiresIn: "7d" });
+        res.json({
+            message: "Login successful",
+            token,
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                role: user.role,
+                accountType: user.account_type || 'creator',
+                account_type: user.account_type || 'creator',
+                isCreator: user.account_type !== 'business' && (user.is_creator || false),
+                companyName: user.company_name || null,
+                credits: user.credits || 0
+            }
+        });
     } catch (error) {
         console.error("Login error:", error);
         res.status(500).json({ error: "Server error", details: error.message });
@@ -1549,11 +1765,17 @@ app.get("/verify", authenticateToken, async (req, res) => {
           u.is_active_creator,
           u.badge_level,
           u.badge_downgrade_start,
+          u.account_type,
+          u.credits,
           cp.profile_image,
           cp.bio AS creator_bio,
-          cp.socials
+          cp.socials,
+          bp.company_name,
+          bp.industry,
+          bp.logo_url
        FROM users u
        LEFT JOIN creators_page cp ON u.id = cp.user_id
+       LEFT JOIN business_profiles bp ON u.id = bp.user_id
        WHERE u.id = $1`,
       [userId]
     );
@@ -1565,8 +1787,10 @@ app.get("/verify", authenticateToken, async (req, res) => {
     const row = result.rows[0];
 
     // Determine final profile image (priority: creators_page → fallback placeholder)
-    const finalProfileImage = row.profile_image || 
+    const finalProfileImage = row.profile_image || row.logo_url ||
       `https://placehold.co/400x400?text=${encodeURIComponent(row.name.charAt(0).toUpperCase())}`;
+
+    const isBusiness = row.account_type === 'business';
 
     res.json({
       user: {
@@ -1576,8 +1800,13 @@ app.get("/verify", authenticateToken, async (req, res) => {
         bio: row.creator_bio || row.bio || "Hey there! I just joined MyPaidPost",
         categories: row.categories || [],
         profile_image: finalProfileImage,
-        profileImage: finalProfileImage,  // both for backward compat
-        isCreator: !!row.is_creator || !!row.profile_image,  // true if either exists
+        profileImage: finalProfileImage,
+        isCreator: !isBusiness && (!!row.is_creator || !!row.profile_image),
+        accountType: row.account_type || 'creator',
+        account_type: row.account_type || 'creator',
+        companyName: row.company_name || null,
+        industry: row.industry || null,
+        credits: row.credits || 0,
         role: row.role || "user",
         socials: row.socials || {},
         badge_level: row.badge_level || 0,
@@ -2078,12 +2307,16 @@ app.get("/explore", async (req, res) => {
             SELECT 
                 p.id, p.user_id AS creator_id, p.type, p.title, p.caption, array_to_json(p.tags) AS tags, 
                 p.images, p.video_url, p.audio_url, p.created_at, p.is_premium, p.visibility, 
-                p.read_time, p.duration, p.status, u.name AS creator_name, cp.profile_image AS creator_avatar, u.badge_level AS creator_badge_level,
+                p.read_time, p.duration, p.status, p.is_copost, p.cohost_host_id,
+                u.name AS creator_name, cp.profile_image AS creator_avatar, u.badge_level AS creator_badge_level,
+                hu.name AS host_name, hcp.profile_image AS host_avatar,
                 COUNT(DISTINCT l.id) AS likes, COUNT(DISTINCT c.id) AS comments,
                 p.views, p.boost_multiplier, array_to_json(u.badges) AS creator_badges
             FROM posts p
             LEFT JOIN users u ON p.user_id = u.id
             LEFT JOIN creators_page cp ON p.user_id = cp.user_id
+            LEFT JOIN users hu ON p.cohost_host_id = hu.id
+            LEFT JOIN creators_page hcp ON p.cohost_host_id = hcp.user_id
             LEFT JOIN likes l ON p.id = l.post_id
             LEFT JOIN comments c ON p.id = c.post_id
             WHERE p.visibility = 'public' AND p.is_draft = FALSE AND p.expires_at > NOW() AND p.status IN ('pending', 'approved')
@@ -2103,7 +2336,7 @@ app.get("/explore", async (req, res) => {
         }
 
         query += `
-            GROUP BY p.id, p.user_id, u.name, cp.profile_image, p.views, p.boost_multiplier, u.badges, u.badge_level
+            GROUP BY p.id, p.user_id, u.name, cp.profile_image, hu.name, hcp.profile_image, p.views, p.boost_multiplier, u.badges, u.badge_level
         `;
 
         switch (sort) {
@@ -2149,7 +2382,11 @@ app.get("/explore", async (req, res) => {
             read_time: post.read_time,
             isLiked: false, // Default to false since user_id is not passed
             boost_multiplier: post.boost_multiplier,
-            creator_badges: post.creator_badges || []
+            creator_badges: post.creator_badges || [],
+            isCopost: post.is_copost || false,
+            cohostHostId: post.cohost_host_id || null,
+            hostName: post.host_name || null,
+            hostAvatar: post.host_avatar || null
         }));
 
         const totalQuery = `
@@ -2492,13 +2729,24 @@ app.get("/creator/:creatorName", async (req, res) => {
             `SELECT 
                p.id, p.type, p.title, p.caption, array_to_json(p.tags) AS tags,
                p.images, p.video_url, p.audio_url, p.created_at, p.is_premium,
-               p.visibility, p.read_time, p.duration, p.status, COUNT(DISTINCT l.id) AS likes, 
+               p.visibility, p.read_time, p.duration, p.status, p.is_copost, p.cohost_host_id,
+               u.name AS author_name, cp.profile_image AS author_avatar,
+               hu.name AS host_name, hcp.profile_image AS host_avatar,
+               COUNT(DISTINCT l.id) AS likes, 
                COUNT(DISTINCT c.id) AS comments, p.views
              FROM posts p
+             JOIN users u ON p.user_id = u.id
+             LEFT JOIN creators_page cp ON p.user_id = cp.user_id
+             LEFT JOIN users hu ON p.cohost_host_id = hu.id
+             LEFT JOIN creators_page hcp ON p.cohost_host_id = hcp.user_id
              LEFT JOIN likes l ON p.id = l.post_id
              LEFT JOIN comments c ON p.id = c.post_id
-             WHERE p.user_id = $1 AND p.visibility = 'public' AND p.is_draft = FALSE AND p.expires_at > NOW() AND p.status IN ('pending', 'approved')
-             GROUP BY p.id, p.views
+             WHERE (p.user_id = $1 OR p.cohost_host_id = $1)
+               AND p.visibility = 'public' 
+               AND p.is_draft = FALSE 
+               AND p.expires_at > NOW() 
+               AND p.status IN ('pending', 'approved')
+             GROUP BY p.id, p.views, u.name, cp.profile_image, hu.name, hcp.profile_image
              ORDER BY p.created_at DESC
              LIMIT 20`,
             [creator.id]
@@ -2568,7 +2816,13 @@ app.get("/creator/:creatorName", async (req, res) => {
                 duration: post.duration,
                 likes: parseInt(post.likes) || 0,
                 comments: parseInt(post.comments) || 0,
-                views: parseInt(post.views) || 0
+                views: parseInt(post.views) || 0,
+                isCopost: post.is_copost || false,
+                cohostHostId: post.cohost_host_id || null,
+                authorName: post.author_name || null,
+                authorAvatar: post.author_avatar || null,
+                hostName: post.host_name || null,
+                hostAvatar: post.host_avatar || null
             })),
             stats,
             subscriptionStatus
@@ -5470,6 +5724,1539 @@ app.get('/api/live/session/:id', async (req, res) => {
     }
 });
 
+// ==========================================
+// CO-HOSTING API
+// ==========================================
+
+// ---- Helper: Create a persistent notification and emit via Socket.io ----
+async function createNotification(userId, type, title, message, data = {}) {
+    try {
+        const result = await pool.query(
+            `INSERT INTO notifications (user_id, type, title, message, data)
+             VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+            [userId, type, title, message, JSON.stringify(data)]
+        );
+        // Emit real-time notification via Socket.io
+        if (global.io) {
+            global.io.to(`user:${userId}`).emit('notification', result.rows[0]);
+        }
+        return result.rows[0];
+    } catch (error) {
+        console.error('Error creating notification:', error);
+    }
+}
+
+// ---- Helper: Check co-hosting eligibility ----
+async function checkCohostEligibility(creatorId) {
+    const [referrals, subscribers, followers] = await Promise.all([
+        pool.query(
+            `SELECT COUNT(*) as count FROM users WHERE referred_by = $1 AND is_active_creator = TRUE`,
+            [creatorId]
+        ),
+        pool.query(
+            `SELECT COUNT(*) as count FROM subscriptions WHERE creator_id = $1 AND end_date > CURRENT_DATE AND payment_status = 'completed'`,
+            [creatorId]
+        ),
+        pool.query(
+            `SELECT COUNT(*) as count FROM followers WHERE following_id = $1`,
+            [creatorId]
+        )
+    ]);
+
+    const activeReferrals = parseInt(referrals.rows[0].count, 10);
+    const activeSubscribers = parseInt(subscribers.rows[0].count, 10);
+    const followerCount = parseInt(followers.rows[0].count, 10);
+
+    return {
+        eligible: activeReferrals >= 10 && activeSubscribers >= 10 && followerCount >= 10,
+        activeReferrals,
+        activeSubscribers,
+        followerCount,
+        requirements: {
+            referrals: { required: 10, current: activeReferrals, met: activeReferrals >= 10 },
+            subscribers: { required: 10, current: activeSubscribers, met: activeSubscribers >= 10 },
+            followers: { required: 10, current: followerCount, met: followerCount >= 10 }
+        }
+    };
+}
+
+// ---- Helper: Process co-hosting revenue split (70% Host / 15% Referrer / 15% Platform) ----
+async function processCohostRevenueSplit(requestId, hostId, totalAmount, transactionId) {
+    const hostAmount = Math.floor(totalAmount * 0.70);
+    let referrerAmount = 0;
+    let platformAmount = Math.floor(totalAmount * 0.15);
+    let referrerId = null;
+
+    // Find if host was referred
+    const hostResult = await pool.query(
+        `SELECT referred_by FROM users WHERE id = $1`, [hostId]
+    );
+    referrerId = hostResult.rows[0]?.referred_by || null;
+
+    if (referrerId) {
+        const referrerActive = await isCreatorActive(referrerId);
+        if (referrerActive) {
+            referrerAmount = Math.floor(totalAmount * 0.15);
+            platformAmount = totalAmount - hostAmount - referrerAmount; // remainder to platform
+        } else {
+            // Dormant referrer — platform gets the referrer share
+            referrerAmount = 0;
+            platformAmount = totalAmount - hostAmount;
+        }
+    } else {
+        // No referrer — platform gets 30% (host share stays 70%)
+        platformAmount = totalAmount - hostAmount;
+    }
+
+    // Record host earning
+    await pool.query(
+        `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+         VALUES ($1, 'cohost_host_earning', $2, 'completed', $3, $4)`,
+        [hostId, hostAmount, `CH-${transactionId}`, `Co-host earning from request #${requestId}`]
+    );
+
+    // Record referrer earning if applicable
+    if (referrerId && referrerAmount > 0) {
+        await pool.query(
+            `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+             VALUES ($1, 'cohost_referrer_earning', $2, 'completed', $3, $4)`,
+            [referrerId, referrerAmount, `CHR-${transactionId}`, `Co-host referral earning from host #${hostId}`]
+        );
+    }
+
+    // Record platform fee
+    if (platformAmount > 0) {
+        await pool.query(
+            `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+             VALUES ($1, 'cohost_platform_fee', $2, 'completed', $3, $4)`,
+            [hostId, -platformAmount, `CHPF-${transactionId}`, `Platform fee for co-host request #${requestId}`]
+        );
+    }
+
+    // Update host's last_sale_at
+    await pool.query(
+        `UPDATE users SET last_sale_at = NOW(), is_active_creator = TRUE WHERE id = $1`,
+        [hostId]
+    );
+
+    return { hostAmount, referrerAmount, platformAmount };
+}
+
+// GET /api/cohost/eligibility — Check if current user meets hosting requirements
+app.get("/api/cohost/eligibility", authenticateToken, async (req, res) => {
+    try {
+        const eligibility = await checkCohostEligibility(req.user.id);
+        res.json(eligibility);
+    } catch (error) {
+        console.error("Cohost eligibility error:", error);
+        res.status(500).json({ error: "Failed to check eligibility", details: error.message });
+    }
+});
+
+// GET /api/cohost/settings/:creatorId — Get a creator's co-host settings
+app.get("/api/cohost/settings/:creatorId", async (req, res) => {
+    try {
+        const { creatorId } = req.params;
+        const result = await pool.query(
+            `SELECT cs.*, u.name as creator_name, cp.profile_image
+             FROM cohost_settings cs
+             JOIN users u ON cs.creator_id = u.id
+             LEFT JOIN creators_page cp ON cs.creator_id = cp.user_id
+             WHERE cs.creator_id = $1`,
+            [creatorId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.json({ enabled: false, price: 299, max_daily_posts: 10, creator_id: parseInt(creatorId) });
+        }
+
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error("Get cohost settings error:", error);
+        res.status(500).json({ error: "Failed to fetch co-host settings" });
+    }
+});
+
+// PUT /api/cohost/settings — Enable/disable co-hosting, set price
+app.put("/api/cohost/settings", authenticateToken, async (req, res) => {
+    try {
+        const creatorId = req.user.id;
+        const { enabled, price, max_daily_posts, description } = req.body;
+
+        // Verify creator
+        const creatorCheck = await pool.query(
+            `SELECT id FROM creators_page WHERE user_id = $1`, [creatorId]
+        );
+        if (creatorCheck.rowCount === 0) {
+            return res.status(403).json({ error: "You must be a creator to enable co-hosting" });
+        }
+
+        // Check eligibility if enabling
+        if (enabled) {
+            const eligibility = await checkCohostEligibility(creatorId);
+            if (!eligibility.eligible) {
+                return res.status(403).json({
+                    error: "You do not meet the requirements to host co-posts",
+                    requirements: eligibility.requirements
+                });
+            }
+        }
+
+        // Validate price
+        const parsedPrice = parseInt(price) || 299;
+        if (parsedPrice < 299) {
+            return res.status(400).json({ error: "Minimum co-hosting price is Kes. 299" });
+        }
+
+        const parsedMaxDaily = Math.min(Math.max(parseInt(max_daily_posts) || 10, 1), 10);
+
+        const result = await pool.query(
+            `INSERT INTO cohost_settings (creator_id, enabled, price, max_daily_posts, description, updated_at)
+             VALUES ($1, $2, $3, $4, $5, NOW())
+             ON CONFLICT (creator_id) DO UPDATE SET
+                enabled = $2, price = $3, max_daily_posts = $4, description = $5, updated_at = NOW()
+             RETURNING *`,
+            [creatorId, !!enabled, parsedPrice, parsedMaxDaily, description || null]
+        );
+
+        res.json({ message: "Co-host settings updated", settings: result.rows[0] });
+    } catch (error) {
+        console.error("Update cohost settings error:", error);
+        res.status(500).json({ error: "Failed to update co-host settings" });
+    }
+});
+
+// POST /api/cohost/request — Guest submits a co-post request
+app.post("/api/cohost/request", authenticateToken, uploadLimiter, upload.fields([
+    { name: 'images', maxCount: 10 },
+    { name: 'video', maxCount: 1 },
+    { name: 'audio', maxCount: 1 }
+]), async (req, res) => {
+    try {
+        const guestId = req.user.id;
+        const { host_id, title, caption, type, tags } = req.body;
+
+        if (!host_id || isNaN(host_id)) {
+            return res.status(400).json({ error: "Invalid host ID" });
+        }
+        if (parseInt(host_id) === guestId) {
+            return res.status(400).json({ error: "You cannot co-post on your own profile" });
+        }
+
+        // Check host has co-hosting enabled
+        const hostSettings = await pool.query(
+            `SELECT * FROM cohost_settings WHERE creator_id = $1 AND enabled = TRUE`,
+            [host_id]
+        );
+        if (hostSettings.rowCount === 0) {
+            return res.status(400).json({ error: "This creator does not have co-hosting enabled" });
+        }
+
+        const settings = hostSettings.rows[0];
+
+        // Check daily limit for the host
+        const dailyCount = await pool.query(
+            `SELECT COUNT(*) as count FROM cohost_requests
+             WHERE host_id = $1 AND status IN ('approved', 'published') AND reviewed_at::date = CURRENT_DATE`,
+            [host_id]
+        );
+        if (parseInt(dailyCount.rows[0].count) >= settings.max_daily_posts) {
+            return res.status(400).json({ error: "This creator has reached their daily co-post limit" });
+        }
+
+        // Check for existing pending request from same guest to same host
+        const existingRequest = await pool.query(
+            `SELECT id FROM cohost_requests WHERE guest_id = $1 AND host_id = $2 AND status = 'pending'`,
+            [guestId, host_id]
+        );
+        if (existingRequest.rowCount > 0) {
+            return res.status(400).json({ error: "You already have a pending co-post request with this creator" });
+        }
+
+        // Upload media files if provided
+        let imageUrls = [];
+        let videoUrl = null;
+        let audioUrl = null;
+
+        if (req.files?.images) {
+            for (const file of req.files.images) {
+                const fileName = `cohost/${Date.now()}_${Math.random().toString(36).substring(7)}_${file.originalname}`;
+                const { error: uploadError } = await supabase.storage
+                    .from('uploads')
+                    .upload(fileName, file.buffer, { contentType: file.mimetype });
+                if (!uploadError) {
+                    const { data: urlData } = supabase.storage.from('uploads').getPublicUrl(fileName);
+                    imageUrls.push({ url: urlData.publicUrl, caption: '' });
+                }
+            }
+        }
+
+        if (req.files?.video?.[0]) {
+            const file = req.files.video[0];
+            const fileName = `cohost/${Date.now()}_${file.originalname}`;
+            const { error: uploadError } = await supabase.storage
+                .from('uploads')
+                .upload(fileName, file.buffer, { contentType: file.mimetype });
+            if (!uploadError) {
+                const { data: urlData } = supabase.storage.from('uploads').getPublicUrl(fileName);
+                videoUrl = urlData.publicUrl;
+            }
+        }
+
+        if (req.files?.audio?.[0]) {
+            const file = req.files.audio[0];
+            const fileName = `cohost/${Date.now()}_${file.originalname}`;
+            const { error: uploadError } = await supabase.storage
+                .from('uploads')
+                .upload(fileName, file.buffer, { contentType: file.mimetype });
+            if (!uploadError) {
+                const { data: urlData } = supabase.storage.from('uploads').getPublicUrl(fileName);
+                audioUrl = urlData.publicUrl;
+            }
+        }
+
+        const parsedTags = tags ? (Array.isArray(tags) ? tags : JSON.parse(tags)) : [];
+
+        // Create the co-host request
+        const result = await pool.query(
+            `INSERT INTO cohost_requests (guest_id, host_id, price, post_title, post_caption, post_type, post_images, post_video_url, post_audio_url, post_tags)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             RETURNING *`,
+            [guestId, host_id, settings.price, title || null, caption || null, type || 'text',
+             JSON.stringify(imageUrls), videoUrl, audioUrl, parsedTags]
+        );
+
+        // Get guest name for notification
+        const guestInfo = await pool.query(`SELECT name FROM users WHERE id = $1`, [guestId]);
+        const guestName = guestInfo.rows[0]?.name || 'A creator';
+
+        // Notify host
+        await createNotification(
+            parseInt(host_id),
+            'cohost_request_received',
+            'New Co-Post Request',
+            `${guestName} wants to co-post on your profile for Kes. ${settings.price}`,
+            { requestId: result.rows[0].id, guestId, guestName }
+        );
+
+        res.status(201).json({
+            message: "Co-post request submitted successfully",
+            request: result.rows[0]
+        });
+    } catch (error) {
+        console.error("Create cohost request error:", error);
+        res.status(500).json({ error: "Failed to submit co-post request", details: error.message });
+    }
+});
+
+// GET /api/cohost/requests/incoming — Host views pending co-post requests
+app.get("/api/cohost/requests/incoming", authenticateToken, async (req, res) => {
+    try {
+        const hostId = req.user.id;
+        const { status = 'all', limit = 20, offset = 0 } = req.query;
+
+        let query = `
+            SELECT cr.*, u.name as guest_name, cp.profile_image as guest_avatar, u.badge_level as guest_badge_level
+            FROM cohost_requests cr
+            JOIN users u ON cr.guest_id = u.id
+            LEFT JOIN creators_page cp ON cr.guest_id = cp.user_id
+            WHERE cr.host_id = $1
+        `;
+        const params = [hostId];
+
+        if (status !== 'all') {
+            query += ` AND cr.status = $${params.length + 1}`;
+            params.push(status);
+        }
+
+        query += ` ORDER BY cr.submitted_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+        params.push(parseInt(limit), parseInt(offset));
+
+        const result = await pool.query(query, params);
+
+        // Also get total count
+        let countQuery = `SELECT COUNT(*) FROM cohost_requests WHERE host_id = $1`;
+        const countParams = [hostId];
+        if (status !== 'all') {
+            countQuery += ` AND status = $2`;
+            countParams.push(status);
+        }
+        const countResult = await pool.query(countQuery, countParams);
+
+        res.json({
+            requests: result.rows,
+            total: parseInt(countResult.rows[0].count)
+        });
+    } catch (error) {
+        console.error("Fetch incoming cohost requests error:", error);
+        res.status(500).json({ error: "Failed to fetch co-post requests" });
+    }
+});
+
+// GET /api/cohost/requests/outgoing — Guest views their sent requests
+app.get("/api/cohost/requests/outgoing", authenticateToken, async (req, res) => {
+    try {
+        const guestId = req.user.id;
+        const { status = 'all', limit = 20, offset = 0 } = req.query;
+
+        let query = `
+            SELECT cr.*, u.name as host_name, cp.profile_image as host_avatar, u.badge_level as host_badge_level
+            FROM cohost_requests cr
+            JOIN users u ON cr.host_id = u.id
+            LEFT JOIN creators_page cp ON cr.host_id = cp.user_id
+            WHERE cr.guest_id = $1
+        `;
+        const params = [guestId];
+
+        if (status !== 'all') {
+            query += ` AND cr.status = $${params.length + 1}`;
+            params.push(status);
+        }
+
+        query += ` ORDER BY cr.submitted_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+        params.push(parseInt(limit), parseInt(offset));
+
+        const result = await pool.query(query, params);
+
+        let countQuery = `SELECT COUNT(*) FROM cohost_requests WHERE guest_id = $1`;
+        const countParams = [guestId];
+        if (status !== 'all') {
+            countQuery += ` AND status = $2`;
+            countParams.push(status);
+        }
+        const countResult = await pool.query(countQuery, countParams);
+
+        res.json({
+            requests: result.rows,
+            total: parseInt(countResult.rows[0].count)
+        });
+    } catch (error) {
+        console.error("Fetch outgoing cohost requests error:", error);
+        res.status(500).json({ error: "Failed to fetch co-post requests" });
+    }
+});
+
+// GET /api/cohost/requests/:id — Get single request detail
+app.get("/api/cohost/requests/:id", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user.id;
+
+        const result = await pool.query(
+            `SELECT cr.*,
+                    gu.name as guest_name, gcp.profile_image as guest_avatar, gu.badge_level as guest_badge_level,
+                    hu.name as host_name, hcp.profile_image as host_avatar, hu.badge_level as host_badge_level
+             FROM cohost_requests cr
+             JOIN users gu ON cr.guest_id = gu.id
+             LEFT JOIN creators_page gcp ON cr.guest_id = gcp.user_id
+             JOIN users hu ON cr.host_id = hu.id
+             LEFT JOIN creators_page hcp ON cr.host_id = hcp.user_id
+             WHERE cr.id = $1 AND (cr.guest_id = $2 OR cr.host_id = $2)`,
+            [id, userId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: "Co-post request not found" });
+        }
+
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error("Fetch cohost request detail error:", error);
+        res.status(500).json({ error: "Failed to fetch co-post request" });
+    }
+});
+
+// PUT /api/cohost/requests/:id/approve — Host approves a request
+app.put("/api/cohost/requests/:id/approve", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const hostId = req.user.id;
+
+        // Verify this request belongs to the host and is pending
+        const requestResult = await pool.query(
+            `SELECT cr.*, cs.max_daily_posts
+             FROM cohost_requests cr
+             JOIN cohost_settings cs ON cr.host_id = cs.creator_id
+             WHERE cr.id = $1 AND cr.host_id = $2 AND cr.status = 'pending'`,
+            [id, hostId]
+        );
+
+        if (requestResult.rowCount === 0) {
+            return res.status(404).json({ error: "Pending co-post request not found" });
+        }
+
+        const request = requestResult.rows[0];
+
+        // Check daily limit
+        const dailyCount = await pool.query(
+            `SELECT COUNT(*) as count FROM cohost_requests
+             WHERE host_id = $1 AND status IN ('approved', 'published') AND reviewed_at::date = CURRENT_DATE`,
+            [hostId]
+        );
+        if (parseInt(dailyCount.rows[0].count) >= request.max_daily_posts) {
+            return res.status(400).json({ error: "You have reached your daily co-post approval limit" });
+        }
+
+        // Update request status to approved (payment will be triggered separately)
+        await pool.query(
+            `UPDATE cohost_requests SET status = 'approved', reviewed_at = NOW() WHERE id = $1`,
+            [id]
+        );
+
+        // Get host name for notification
+        const hostInfo = await pool.query(`SELECT name FROM users WHERE id = $1`, [hostId]);
+        const hostName = hostInfo.rows[0]?.name || 'The creator';
+
+        // Notify guest that request was approved — they now need to pay
+        await createNotification(
+            request.guest_id,
+            'cohost_request_approved',
+            'Co-Post Request Approved!',
+            `${hostName} approved your co-post request. Complete payment of Kes. ${request.price} to publish.`,
+            { requestId: parseInt(id), hostId, hostName, price: request.price }
+        );
+
+        res.json({ message: "Co-post request approved. Waiting for guest payment." });
+    } catch (error) {
+        console.error("Approve cohost request error:", error);
+        res.status(500).json({ error: "Failed to approve co-post request" });
+    }
+});
+
+// PUT /api/cohost/requests/:id/reject — Host rejects a request
+app.put("/api/cohost/requests/:id/reject", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const hostId = req.user.id;
+
+        const requestResult = await pool.query(
+            `SELECT * FROM cohost_requests WHERE id = $1 AND host_id = $2 AND status = 'pending'`,
+            [id, hostId]
+        );
+
+        if (requestResult.rowCount === 0) {
+            return res.status(404).json({ error: "Pending co-post request not found" });
+        }
+
+        const request = requestResult.rows[0];
+
+        await pool.query("BEGIN");
+
+        // Update request status
+        await pool.query(
+            `UPDATE cohost_requests SET status = 'rejected', reviewed_at = NOW(), payment_status = 'refunded' WHERE id = $1`,
+            [id]
+        );
+
+        // If payment was already held, refund it
+        if (request.payment_status === 'held') {
+            await pool.query(
+                `UPDATE users SET credits = credits + $1 WHERE id = $2`,
+                [request.price, request.guest_id]
+            );
+            await pool.query(
+                `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+                 VALUES ($1, 'cohost_refund', $2, 'completed', $3, $4)`,
+                [request.guest_id, request.price, `CHREF-${id}`, `Refund for rejected co-post request #${id}`]
+            );
+        }
+
+        await pool.query("COMMIT");
+
+        // Get host name for notification
+        const hostInfo = await pool.query(`SELECT name FROM users WHERE id = $1`, [hostId]);
+        const hostName = hostInfo.rows[0]?.name || 'The creator';
+
+        // Notify guest
+        await createNotification(
+            request.guest_id,
+            'cohost_request_rejected',
+            'Co-Post Request Declined',
+            `${hostName} declined your co-post request.${request.payment_status === 'held' ? ' Your payment of Kes. ' + request.price + ' has been refunded.' : ''}`,
+            { requestId: parseInt(id), hostId, hostName }
+        );
+
+        res.json({ message: "Co-post request rejected" });
+    } catch (error) {
+        await pool.query("ROLLBACK");
+        console.error("Reject cohost request error:", error);
+        res.status(500).json({ error: "Failed to reject co-post request" });
+    }
+});
+
+// POST /api/cohost/pay — Guest pays for an approved co-post request
+app.post("/api/cohost/pay", authenticateToken, async (req, res) => {
+    try {
+        const guestId = req.user.id;
+        const { requestId, payment_method, phoneNumber } = req.body;
+
+        if (!requestId || isNaN(requestId)) {
+            return res.status(400).json({ error: "Invalid request ID" });
+        }
+
+        // Verify the request is approved and belongs to the guest
+        const requestResult = await pool.query(
+            `SELECT * FROM cohost_requests WHERE id = $1 AND guest_id = $2 AND status = 'approved' AND payment_status = 'pending'`,
+            [requestId, guestId]
+        );
+
+        if (requestResult.rowCount === 0) {
+            return res.status(404).json({ error: "Approved co-post request not found or already paid" });
+        }
+
+        const request = requestResult.rows[0];
+
+        if (payment_method === 'wallet') {
+            // Check guest's credit balance
+            const guestCredits = await pool.query(
+                `SELECT credits FROM users WHERE id = $1`, [guestId]
+            );
+            const credits = parseInt(guestCredits.rows[0]?.credits || 0);
+
+            if (credits < request.price) {
+                return res.status(400).json({
+                    error: "Insufficient credits",
+                    required: request.price,
+                    available: credits
+                });
+            }
+
+            await pool.query("BEGIN");
+
+            // Deduct from guest
+            await pool.query(
+                `UPDATE users SET credits = credits - $1 WHERE id = $2`,
+                [request.price, guestId]
+            );
+
+            // Record guest payment transaction
+            const txId = `CHPAY-${requestId}-${Date.now()}`;
+            await pool.query(
+                `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+                 VALUES ($1, 'cohost_payment', $2, 'completed', $3, $4)`,
+                [guestId, -request.price, txId, `Co-post payment to host #${request.host_id} for request #${requestId}`]
+            );
+
+            // Process revenue split
+            await processCohostRevenueSplit(requestId, request.host_id, request.price, txId);
+
+            // Update request payment status
+            await pool.query(
+                `UPDATE cohost_requests SET payment_status = 'completed', payment_method = 'wallet' WHERE id = $1`,
+                [requestId]
+            );
+
+            // Create the actual co-post in the posts table
+            const postResult = await pool.query(
+                `INSERT INTO posts (user_id, type, title, caption, tags, images, video_url, audio_url, is_copost, cohost_request_id, cohost_host_id, status, is_draft)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9, $10, 'approved', FALSE)
+                 RETURNING id`,
+                [guestId, request.post_type || 'text', request.post_title, request.post_caption,
+                 request.post_tags || '{}', JSON.stringify(request.post_images || []),
+                 request.post_video_url, request.post_audio_url,
+                 requestId, request.host_id]
+            );
+
+            // Update request to published
+            await pool.query(
+                `UPDATE cohost_requests SET status = 'published' WHERE id = $1`,
+                [requestId]
+            );
+
+            await pool.query("COMMIT");
+
+            // Get guest name for notification
+            const guestInfo = await pool.query(`SELECT name FROM users WHERE id = $1`, [guestId]);
+            const guestName = guestInfo.rows[0]?.name || 'A creator';
+
+            // Notify host about the payment and published co-post
+            await createNotification(
+                request.host_id,
+                'cohost_payment_received',
+                'Co-Post Published!',
+                `${guestName} has paid Kes. ${request.price} and their co-post is now live on your profile.`,
+                { requestId, guestId, guestName, postId: postResult.rows[0].id, amount: request.price }
+            );
+
+            res.json({
+                message: "Payment successful! Co-post is now published.",
+                postId: postResult.rows[0].id
+            });
+
+        } else if (payment_method === 'mpesa') {
+            // M-Pesa STK Push flow
+            if (!phoneNumber || !/^254\d{9}$/.test(phoneNumber)) {
+                return res.status(400).json({ error: "Invalid phone number. Must be in 254XXXXXXXXX format" });
+            }
+
+            const token = await getAccessToken();
+            const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
+            const password = Buffer.from(`${process.env.PAYBILL_NUMBER}${process.env.PASSKEY}${timestamp}`).toString('base64');
+
+            const response = await axios.post(
+                process.env.MPESA_ENV === 'production'
+                    ? 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest'
+                    : 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+                {
+                    BusinessShortCode: process.env.PAYBILL_NUMBER,
+                    Password: password,
+                    Timestamp: timestamp,
+                    TransactionType: 'CustomerPayBillOnline',
+                    Amount: request.price,
+                    PartyA: phoneNumber,
+                    PartyB: process.env.PAYBILL_NUMBER,
+                    PhoneNumber: phoneNumber,
+                    CallBackURL: `${process.env.API_BASE_URL || 'https://mpp-backend-service.onrender.com'}/api/mpesa/callback_cohost`,
+                    AccountReference: `MPP_CoHost_${requestId}`,
+                    TransactionDesc: 'MyPaidPost Co-Host Payment'
+                },
+                { headers: { Authorization: `Bearer ${token}` } }
+            );
+
+            // Save the CheckoutRequestID
+            await pool.query(
+                `UPDATE cohost_requests SET mpesa_transaction_id = $1, payment_method = 'mpesa' WHERE id = $2`,
+                [response.data.CheckoutRequestID, requestId]
+            );
+
+            res.json({ success: true, message: "M-Pesa payment initiated. Check your phone.", data: response.data });
+        } else {
+            return res.status(400).json({ error: "Invalid payment method. Use 'wallet' or 'mpesa'" });
+        }
+    } catch (error) {
+        await pool.query("ROLLBACK").catch(() => {});
+        console.error("Cohost payment error:", error);
+        res.status(500).json({ error: "Payment failed", details: error.message });
+    }
+});
+
+// POST /api/mpesa/callback_cohost — M-Pesa callback for co-host payments
+app.post("/api/mpesa/callback_cohost", async (req, res) => {
+    try {
+        console.log("📥 Co-host M-Pesa callback:", JSON.stringify(req.body, null, 2));
+
+        const stkCallback = req.body.Body?.stkCallback;
+        if (!stkCallback || typeof stkCallback.ResultCode === 'undefined') {
+            return res.status(400).json({ error: "Invalid callback data" });
+        }
+
+        const { ResultCode, CheckoutRequestID, CallbackMetadata } = stkCallback;
+        const transactionId = CallbackMetadata?.Item?.find(item => item.Name === 'MpesaReceiptNumber')?.Value || null;
+
+        // Find the co-host request
+        const requestResult = await pool.query(
+            `SELECT * FROM cohost_requests WHERE mpesa_transaction_id = $1`,
+            [CheckoutRequestID]
+        );
+
+        if (requestResult.rowCount === 0) {
+            console.error("No matching co-host request for CheckoutRequestID:", CheckoutRequestID);
+            return res.status(404).json({ error: "Request not found" });
+        }
+
+        const request = requestResult.rows[0];
+
+        if (ResultCode === 0) {
+            // Payment successful
+            await pool.query("BEGIN");
+
+            const txId = transactionId || `CHMPESA-${request.id}-${Date.now()}`;
+
+            // Record guest payment
+            await pool.query(
+                `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+                 VALUES ($1, 'cohost_payment', $2, 'completed', $3, $4)`,
+                [request.guest_id, -request.price, txId, `M-Pesa co-post payment to host #${request.host_id}`]
+            );
+
+            // Process revenue split
+            await processCohostRevenueSplit(request.id, request.host_id, request.price, txId);
+
+            // Create the actual co-post
+            const postResult = await pool.query(
+                `INSERT INTO posts (user_id, type, title, caption, tags, images, video_url, audio_url, is_copost, cohost_request_id, cohost_host_id, status, is_draft)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9, $10, 'approved', FALSE)
+                 RETURNING id`,
+                [request.guest_id, request.post_type || 'text', request.post_title, request.post_caption,
+                 request.post_tags || '{}', JSON.stringify(request.post_images || []),
+                 request.post_video_url, request.post_audio_url,
+                 request.id, request.host_id]
+            );
+
+            // Update request status
+            await pool.query(
+                `UPDATE cohost_requests SET status = 'published', payment_status = 'completed', mpesa_transaction_id = $1 WHERE id = $2`,
+                [transactionId || CheckoutRequestID, request.id]
+            );
+
+            await pool.query("COMMIT");
+
+            // Get names for notifications
+            const guestInfo = await pool.query(`SELECT name FROM users WHERE id = $1`, [request.guest_id]);
+            const guestName = guestInfo.rows[0]?.name || 'A creator';
+
+            // Notify both parties
+            await createNotification(
+                request.host_id,
+                'cohost_payment_received',
+                'Co-Post Published!',
+                `${guestName} has paid Kes. ${request.price} and their co-post is now live on your profile.`,
+                { requestId: request.id, guestId: request.guest_id, postId: postResult.rows[0].id, amount: request.price }
+            );
+
+            await createNotification(
+                request.guest_id,
+                'cohost_post_published',
+                'Your Co-Post is Live!',
+                `Your co-post has been published on the host's profile.`,
+                { requestId: request.id, postId: postResult.rows[0].id }
+            );
+        } else {
+            // Payment failed
+            await pool.query(
+                `UPDATE cohost_requests SET payment_status = 'failed' WHERE id = $1`,
+                [request.id]
+            );
+
+            await createNotification(
+                request.guest_id,
+                'cohost_payment_failed',
+                'Co-Post Payment Failed',
+                `Your M-Pesa payment for the co-post failed. Please try again.`,
+                { requestId: request.id }
+            );
+        }
+
+        res.sendStatus(200);
+    } catch (error) {
+        await pool.query("ROLLBACK").catch(() => {});
+        console.error("Co-host M-Pesa callback error:", error);
+        res.status(500).json({ error: "Callback processing failed" });
+    }
+});
+
+// GET /api/cohost/daily-count/:hostId — Check how many co-posts host has approved today
+app.get("/api/cohost/daily-count/:hostId", authenticateToken, async (req, res) => {
+    try {
+        const { hostId } = req.params;
+        const result = await pool.query(
+            `SELECT COUNT(*) as count FROM cohost_requests
+             WHERE host_id = $1 AND status IN ('approved', 'published') AND reviewed_at::date = CURRENT_DATE`,
+            [hostId]
+        );
+        const settings = await pool.query(
+            `SELECT max_daily_posts FROM cohost_settings WHERE creator_id = $1`,
+            [hostId]
+        );
+        const maxDaily = settings.rows[0]?.max_daily_posts || 10;
+        const count = parseInt(result.rows[0].count);
+
+        res.json({ count, maxDaily, remaining: Math.max(0, maxDaily - count) });
+    } catch (error) {
+        console.error("Daily count error:", error);
+        res.status(500).json({ error: "Failed to fetch daily count" });
+    }
+});
+
+// ==========================================
+// BUSINESS / SPONSOR CAMPAIGNS API (ESCROW)
+// ==========================================
+
+// POST /api/campaigns — Business creates a campaign & deposits into Escrow
+app.post("/api/campaigns", authenticateToken, async (req, res) => {
+    try {
+        const businessId = req.user.id;
+        const { title, description, budget, deliverables, deadline, payment_method, phoneNumber } = req.body;
+
+        if (!title || !description) {
+            return res.status(400).json({ error: "Title and description are required" });
+        }
+        const parsedBudget = parseInt(budget);
+        if (isNaN(parsedBudget) || parsedBudget <= 0) {
+            return res.status(400).json({ error: "Valid budget amount is required" });
+        }
+
+        // Check wallet balance if payment_method is wallet
+        if (payment_method === 'wallet') {
+            const userRes = await pool.query(`SELECT credits FROM users WHERE id = $1`, [businessId]);
+            const credits = parseInt(userRes.rows[0]?.credits || 0);
+            if (credits < parsedBudget) {
+                return res.status(400).json({
+                    error: "Insufficient wallet balance to fund campaign escrow",
+                    required: parsedBudget,
+                    available: credits
+                });
+            }
+
+            await pool.query("BEGIN");
+
+            // Deduct from business user
+            await pool.query(`UPDATE users SET credits = credits - $1 WHERE id = $2`, [parsedBudget, businessId]);
+
+            // Create campaign in 'open' status with escrow 'deposited'
+            const result = await pool.query(
+                `INSERT INTO campaigns (business_id, title, description, budget, deliverables, deadline, status, escrow_amount, escrow_status, payment_method)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'open', $7, 'deposited', 'wallet')
+                 RETURNING *`,
+                [businessId, title, description, parsedBudget, deliverables || null, deadline || null, parsedBudget]
+            );
+
+            // Record transaction
+            await pool.query(
+                `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+                 VALUES ($1, 'escrow_deposit', $2, 'completed', $3, $4)`,
+                [businessId, -parsedBudget, `ESC-${result.rows[0].id}-${Date.now()}`, `Escrow deposit for campaign #${result.rows[0].id}: ${title}`]
+            );
+
+            await pool.query("COMMIT");
+
+            res.status(201).json({
+                message: "Campaign created and funds placed in escrow",
+                campaign: result.rows[0]
+            });
+        } else if (payment_method === 'mpesa') {
+            // M-Pesa STK push for escrow deposit (Supports 07..., 01..., 254..., +254...)
+            let formattedPhone = phoneNumber ? String(phoneNumber).trim().replace(/[\s\-\+]/g, '') : '';
+            if (/^0[71]\d{8}$/.test(formattedPhone)) {
+                formattedPhone = '254' + formattedPhone.substring(1);
+            }
+            if (!/^254[71]\d{8}$/.test(formattedPhone)) {
+                return res.status(400).json({ error: "Invalid Kenyan phone number. Use format 07XXXXXXXX, 01XXXXXXXX, or 254XXXXXXXXX" });
+            }
+
+            const token = await getAccessToken();
+            const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
+            const password = Buffer.from(`${process.env.PAYBILL_NUMBER}${process.env.PASSKEY}${timestamp}`).toString('base64');
+
+            // Create campaign in pending status (Must NOT be listed publicly until escrow deposit is verified)
+            const campaignResult = await pool.query(
+                `INSERT INTO campaigns (business_id, title, description, budget, deliverables, deadline, status, escrow_amount, escrow_status, payment_method)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'pending_deposit', $7, 'pending_deposit', 'mpesa')
+                 RETURNING *`,
+                [businessId, title, description, parsedBudget, deliverables || null, deadline || null, parsedBudget]
+            );
+
+            const campaignId = campaignResult.rows[0].id;
+
+            const response = await axios.post(
+                process.env.MPESA_ENV === 'production'
+                    ? 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest'
+                    : 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+                {
+                    BusinessShortCode: process.env.PAYBILL_NUMBER,
+                    Password: password,
+                    Timestamp: timestamp,
+                    TransactionType: 'CustomerPayBillOnline',
+                    Amount: parsedBudget,
+                    PartyA: formattedPhone,
+                    PartyB: process.env.PAYBILL_NUMBER,
+                    PhoneNumber: formattedPhone,
+                    CallBackURL: `${process.env.API_BASE_URL || 'https://mpp-backend-service.onrender.com'}/api/mpesa/callback`,
+                    AccountReference: `MPP_Camp_${campaignId}`,
+                    TransactionDesc: 'MyPaidPost Campaign Escrow'
+                },
+                { headers: { Authorization: `Bearer ${token}` } }
+            );
+
+            await pool.query(
+                `UPDATE campaigns SET mpesa_transaction_id = $1 WHERE id = $2`,
+                [response.data.CheckoutRequestID, campaignId]
+            );
+
+            res.status(201).json({
+                message: "STK push sent! Please enter your PIN on your phone to complete escrow deposit.",
+                campaign: campaignResult.rows[0],
+                stk: response.data
+            });
+        } else {
+            return res.status(400).json({ error: "Invalid payment method. Choose 'wallet' or 'mpesa'" });
+        }
+    } catch (error) {
+        await pool.query("ROLLBACK").catch(() => {});
+        console.error("Create campaign error:", error);
+        res.status(500).json({ error: "Failed to create campaign", details: error.message });
+    }
+});
+
+// GET /api/campaigns — Creators browse open available campaigns
+app.get("/api/campaigns", authenticateToken, async (req, res) => {
+    try {
+        const { limit = 30, offset = 0, status = 'open' } = req.query;
+
+        const result = await pool.query(
+            `SELECT c.*, u.name as business_name, bp.logo_url as business_logo, bp.industry,
+                    (SELECT COUNT(*) FROM campaign_proposals WHERE campaign_id = c.id) as proposals_count
+             FROM campaigns c
+             JOIN users u ON c.business_id = u.id
+             LEFT JOIN business_profiles bp ON c.business_id = bp.user_id
+             WHERE ($1 = 'all' OR c.status = $1) AND c.escrow_status = 'deposited'
+             ORDER BY c.created_at DESC
+             LIMIT $2 OFFSET $3`,
+            [status, parseInt(limit), parseInt(offset)]
+        );
+
+        res.json({ campaigns: result.rows });
+    } catch (error) {
+        console.error("Fetch campaigns error:", error);
+        res.status(500).json({ error: "Failed to fetch campaigns" });
+    }
+});
+
+// GET /api/campaigns/:id — Single campaign detail with proposals & ratings
+app.get("/api/campaigns/:id", authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user.id;
+
+        const campaignResult = await pool.query(
+            `SELECT c.*, u.name as business_name, bp.logo_url as business_logo, bp.website, bp.industry
+             FROM campaigns c
+             JOIN users u ON c.business_id = u.id
+             LEFT JOIN business_profiles bp ON c.business_id = bp.user_id
+             WHERE c.id = $1`,
+            [id]
+        );
+
+        if (campaignResult.rowCount === 0) {
+            return res.status(404).json({ error: "Campaign not found" });
+        }
+
+        const campaign = campaignResult.rows[0];
+
+        // Fetch proposals (all if business owner, otherwise only user's proposal)
+        let proposals = [];
+        if (campaign.business_id === userId) {
+            const propRes = await pool.query(
+                `SELECT cp.*, u.name as creator_name, cpage.profile_image as creator_avatar, u.badge_level
+                 FROM campaign_proposals cp
+                 JOIN users u ON cp.creator_id = u.id
+                 LEFT JOIN creators_page cpage ON cp.creator_id = cpage.user_id
+                 WHERE cp.campaign_id = $1
+                 ORDER BY cp.submitted_at DESC`,
+                [id]
+            );
+            proposals = propRes.rows;
+        } else {
+            const userProp = await pool.query(
+                `SELECT * FROM campaign_proposals WHERE campaign_id = $1 AND creator_id = $2`,
+                [id, userId]
+            );
+            proposals = userProp.rows;
+        }
+
+        // Fetch ratings
+        const ratingsResult = await pool.query(
+            `SELECT cr.*, u.name as rater_name
+             FROM campaign_ratings cr
+             JOIN users u ON cr.rater_id = u.id
+             WHERE cr.campaign_id = $1`,
+            [id]
+        );
+
+        res.json({
+            campaign,
+            proposals,
+            ratings: ratingsResult.rows
+        });
+    } catch (error) {
+        console.error("Fetch campaign detail error:", error);
+        res.status(500).json({ error: "Failed to fetch campaign detail" });
+    }
+});
+
+// GET /api/business/campaigns — Business views all their created campaigns
+app.get("/api/business/campaigns", authenticateToken, async (req, res) => {
+    try {
+        const businessId = req.user.id;
+        const result = await pool.query(
+            `SELECT c.*,
+                    (SELECT COUNT(*) FROM campaign_proposals WHERE campaign_id = c.id) as proposals_count
+             FROM campaigns c
+             WHERE c.business_id = $1
+             ORDER BY c.created_at DESC`,
+            [businessId]
+        );
+        res.json({ campaigns: result.rows });
+    } catch (error) {
+        console.error("Fetch business campaigns error:", error);
+        res.status(500).json({ error: "Failed to fetch campaigns" });
+    }
+});
+
+// GET /api/creator/campaign-proposals — Creator views all their submitted proposals
+app.get("/api/creator/campaign-proposals", authenticateToken, async (req, res) => {
+    try {
+        const creatorId = req.user.id;
+        const result = await pool.query(
+            `SELECT cp.*, c.title as campaign_title, c.budget, c.status as campaign_status, c.deadline,
+                    u.name as business_name
+             FROM campaign_proposals cp
+             JOIN campaigns c ON cp.campaign_id = c.id
+             JOIN users u ON c.business_id = u.id
+             WHERE cp.creator_id = $1
+             ORDER BY cp.submitted_at DESC`,
+            [creatorId]
+        );
+        res.json({ proposals: result.rows });
+    } catch (error) {
+        console.error("Fetch creator proposals error:", error);
+        res.status(500).json({ error: "Failed to fetch proposals" });
+    }
+});
+
+// POST /api/campaigns/:id/proposals — Creator submits proposal (enforces 5 purchased credits deduction)
+app.post("/api/campaigns/:id/proposals", authenticateToken, async (req, res) => {
+    try {
+        const creatorId = req.user.id;
+        const campaignId = req.params.id;
+        const { pitch, content_sample, proposed_price } = req.body;
+
+        // Verify campaign is open
+        const campRes = await pool.query(`SELECT * FROM campaigns WHERE id = $1 AND status = 'open'`, [campaignId]);
+        if (campRes.rowCount === 0) {
+            return res.status(400).json({ error: "Campaign is not open for proposals" });
+        }
+        const campaign = campRes.rows[0];
+
+        // Check for existing proposal
+        const existing = await pool.query(
+            `SELECT id FROM campaign_proposals WHERE campaign_id = $1 AND creator_id = $2`,
+            [campaignId, creatorId]
+        );
+        if (existing.rowCount > 0) {
+            return res.status(400).json({ error: "You have already submitted a proposal for this campaign" });
+        }
+
+        // SPEC REQUIREMENT: Uses 5 PURCHASED credits (free credits cannot be used)
+        const userRes = await pool.query(`SELECT credits FROM users WHERE id = $1`, [creatorId]);
+        const purchasedCredits = parseInt(userRes.rows[0]?.credits || 0);
+
+        if (purchasedCredits < 5) {
+            return res.status(400).json({
+                error: "Submitting a proposal requires 5 purchased credits. Free credits cannot be used.",
+                availablePurchasedCredits: purchasedCredits,
+                required: 5
+            });
+        }
+
+        await pool.query("BEGIN");
+
+        // Deduct 5 purchased credits
+        await pool.query(`UPDATE users SET credits = credits - 5 WHERE id = $1`, [creatorId]);
+
+        // Log credit transaction
+        await pool.query(
+            `INSERT INTO credit_transactions (user_id, amount, type, description)
+             VALUES ($1, -5, 'campaign_proposal', $2)`,
+            [creatorId, `Proposal fee (5 credits) for campaign #${campaignId}`]
+        );
+
+        // Insert proposal
+        const proposalResult = await pool.query(
+            `INSERT INTO campaign_proposals (campaign_id, creator_id, pitch, content_sample, proposed_price, status, credits_spent)
+             VALUES ($1, $2, $3, $4, $5, 'pending', 5)
+             RETURNING *`,
+            [campaignId, creatorId, pitch || null, content_sample || null, proposed_price || campaign.budget]
+        );
+
+        await pool.query("COMMIT");
+
+        // Get creator name for notification
+        const creatorInfo = await pool.query(`SELECT name FROM users WHERE id = $1`, [creatorId]);
+        const creatorName = creatorInfo.rows[0]?.name || 'A creator';
+
+        // Notify business owner
+        await createNotification(
+            campaign.business_id,
+            'campaign_proposal_received',
+            'New Campaign Proposal!',
+            `${creatorName} submitted a proposal for your campaign "${campaign.title}"`,
+            { campaignId: parseInt(campaignId), proposalId: proposalResult.rows[0].id }
+        );
+
+        res.status(201).json({
+            message: "Proposal submitted successfully! 5 credits deducted.",
+            proposal: proposalResult.rows[0]
+        });
+    } catch (error) {
+        await pool.query("ROLLBACK").catch(() => {});
+        console.error("Submit proposal error:", error);
+        res.status(500).json({ error: "Failed to submit proposal", details: error.message });
+    }
+});
+
+// PUT /api/campaigns/:id/proposals/:proposalId/accept — Brand accepts proposal
+app.put("/api/campaigns/:id/proposals/:proposalId/accept", authenticateToken, async (req, res) => {
+    try {
+        const businessId = req.user.id;
+        const { id: campaignId, proposalId } = req.params;
+
+        const campRes = await pool.query(`SELECT * FROM campaigns WHERE id = $1 AND business_id = $2`, [campaignId, businessId]);
+        if (campRes.rowCount === 0) return res.status(403).json({ error: "Unauthorized" });
+
+        await pool.query("BEGIN");
+
+        // Accept this proposal
+        await pool.query(`UPDATE campaign_proposals SET status = 'accepted', reviewed_at = NOW() WHERE id = $1`, [proposalId]);
+
+        // Reject other pending proposals
+        await pool.query(
+            `UPDATE campaign_proposals SET status = 'rejected', reviewed_at = NOW() WHERE campaign_id = $1 AND id != $2 AND status = 'pending'`,
+            [campaignId, proposalId]
+        );
+
+        // Update campaign status
+        await pool.query(
+            `UPDATE campaigns SET status = 'in_progress', selected_proposal_id = $1 WHERE id = $2`,
+            [proposalId, campaignId]
+        );
+
+        await pool.query("COMMIT");
+
+        // Get creator ID to notify
+        const prop = await pool.query(`SELECT creator_id FROM campaign_proposals WHERE id = $1`, [proposalId]);
+        if (prop.rowCount > 0) {
+            await createNotification(
+                prop.rows[0].creator_id,
+                'campaign_proposal_accepted',
+                'Proposal Accepted!',
+                `Your proposal for campaign "${campRes.rows[0].title}" was accepted! You can now create and deliver your post.`,
+                { campaignId: parseInt(campaignId), proposalId: parseInt(proposalId) }
+            );
+        }
+
+        res.json({ message: "Proposal accepted! Campaign is now in progress." });
+    } catch (error) {
+        await pool.query("ROLLBACK").catch(() => {});
+        console.error("Accept proposal error:", error);
+        res.status(500).json({ error: "Failed to accept proposal" });
+    }
+});
+
+// PUT /api/campaigns/:id/proposals/:proposalId/reject — Brand rejects proposal
+app.put("/api/campaigns/:id/proposals/:proposalId/reject", authenticateToken, async (req, res) => {
+    try {
+        const businessId = req.user.id;
+        const { id: campaignId, proposalId } = req.params;
+
+        const campRes = await pool.query(`SELECT * FROM campaigns WHERE id = $1 AND business_id = $2`, [campaignId, businessId]);
+        if (campRes.rowCount === 0) return res.status(403).json({ error: "Unauthorized" });
+
+        await pool.query(
+            `UPDATE campaign_proposals SET status = 'rejected', reviewed_at = NOW() WHERE id = $1`,
+            [proposalId]
+        );
+
+        const prop = await pool.query(`SELECT creator_id FROM campaign_proposals WHERE id = $1`, [proposalId]);
+        if (prop.rowCount > 0) {
+            await createNotification(
+                prop.rows[0].creator_id,
+                'campaign_proposal_rejected',
+                'Proposal Declined',
+                `Your proposal for campaign "${campRes.rows[0].title}" was not selected.`,
+                { campaignId: parseInt(campaignId) }
+            );
+        }
+
+        res.json({ message: "Proposal rejected" });
+    } catch (error) {
+        console.error("Reject proposal error:", error);
+        res.status(500).json({ error: "Failed to reject proposal" });
+    }
+});
+
+// PUT /api/campaigns/:id/deliver — Creator delivers campaign post
+app.put("/api/campaigns/:id/deliver", authenticateToken, async (req, res) => {
+    try {
+        const creatorId = req.user.id;
+        const campaignId = req.params.id;
+        const { delivery_notes, title, caption, images, video_url } = req.body;
+
+        const propRes = await pool.query(
+            `SELECT cp.*, c.business_id, c.title as campaign_title
+             FROM campaign_proposals cp
+             JOIN campaigns c ON cp.campaign_id = c.id
+             WHERE cp.campaign_id = $1 AND cp.creator_id = $2 AND cp.status = 'accepted'`,
+            [campaignId, creatorId]
+        );
+
+        if (propRes.rowCount === 0) {
+            return res.status(400).json({ error: "No active accepted proposal found for this campaign" });
+        }
+
+        const proposal = propRes.rows[0];
+
+        // Create the deliverable post
+        const postResult = await pool.query(
+            `INSERT INTO posts (user_id, type, title, caption, images, video_url, is_copost, cohost_host_id, status, is_draft)
+             VALUES ($1, 'image', $2, $3, $4, $5, TRUE, $6, 'approved', FALSE)
+             RETURNING id`,
+            [creatorId, title || proposal.campaign_title, caption || delivery_notes || '',
+             JSON.stringify(images || []), video_url || null, proposal.business_id]
+        );
+
+        // Update proposal status to delivered
+        await pool.query(
+            `UPDATE campaign_proposals 
+             SET status = 'delivered', delivered_at = NOW(), delivery_notes = $1, post_id = $2
+             WHERE id = $3`,
+            [delivery_notes || null, postResult.rows[0].id, proposal.id]
+        );
+
+        // Notify brand
+        await createNotification(
+            proposal.business_id,
+            'campaign_delivered',
+            'Campaign Deliverable Ready for Review!',
+            `The creator has delivered the post for "${proposal.campaign_title}". Review and release escrow.`,
+            { campaignId: parseInt(campaignId), proposalId: proposal.id, postId: postResult.rows[0].id }
+        );
+
+        res.json({ message: "Deliverable marked as ready for review!", postId: postResult.rows[0].id });
+    } catch (error) {
+        console.error("Deliver campaign error:", error);
+        res.status(500).json({ error: "Failed to submit delivery", details: error.message });
+    }
+});
+
+// PUT /api/campaigns/:id/approve-delivery — Brand approves deliverable -> releases Escrow
+app.put("/api/campaigns/:id/approve-delivery", authenticateToken, async (req, res) => {
+    try {
+        const businessId = req.user.id;
+        const campaignId = req.params.id;
+
+        const campRes = await pool.query(
+            `SELECT c.*, cp.creator_id, cp.proposed_price, cp.id as proposal_id
+             FROM campaigns c
+             JOIN campaign_proposals cp ON c.selected_proposal_id = cp.id
+             WHERE c.id = $1 AND c.business_id = $2 AND cp.status = 'delivered'`,
+            [campaignId, businessId]
+        );
+
+        if (campRes.rowCount === 0) {
+            return res.status(400).json({ error: "Campaign not ready for escrow release or not authorized" });
+        }
+
+        const campaign = campRes.rows[0];
+        const payoutAmount = campaign.escrow_amount || campaign.budget;
+        const creatorId = campaign.creator_id;
+
+        await pool.query("BEGIN");
+
+        // Release escrow: 70% to creator, 15% to host's referrer, 15% platform
+        const creatorCut = Math.floor(payoutAmount * 0.70);
+        let referrerCut = 0;
+        let platformCut = Math.floor(payoutAmount * 0.15);
+
+        const hostResult = await pool.query(`SELECT referred_by FROM users WHERE id = $1`, [creatorId]);
+        const referrerId = hostResult.rows[0]?.referred_by || null;
+
+        if (referrerId) {
+            const referrerActive = await isCreatorActive(referrerId);
+            if (referrerActive) {
+                referrerCut = Math.floor(payoutAmount * 0.15);
+                platformCut = payoutAmount - creatorCut - referrerCut;
+            } else {
+                platformCut = payoutAmount - creatorCut;
+            }
+        } else {
+            platformCut = payoutAmount - creatorCut;
+        }
+
+        // Credit creator's wallet
+        await pool.query(`UPDATE users SET credits = credits + $1 WHERE id = $2`, [creatorCut, creatorId]);
+
+        // Record creator earning transaction
+        const txId = `ESC-REL-${campaignId}-${Date.now()}`;
+        await pool.query(
+            `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+             VALUES ($1, 'escrow_release', $2, 'completed', $3, $4)`,
+            [creatorId, creatorCut, txId, `Campaign sponsorship payout for #${campaignId}`]
+        );
+
+        // Credit referrer if applicable
+        if (referrerId && referrerCut > 0) {
+            await pool.query(`UPDATE users SET credits = credits + $1 WHERE id = $2`, [referrerCut, referrerId]);
+            await pool.query(
+                `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+                 VALUES ($1, 'cohost_referrer_earning', $2, 'completed', $3, $4)`,
+                [referrerId, referrerCut, `ESCR-${txId}`, `Campaign referral commission from creator #${creatorId}`]
+            );
+        }
+
+        // Update campaign status
+        await pool.query(
+            `UPDATE campaigns SET status = 'completed', escrow_status = 'released' WHERE id = $1`,
+            [campaignId]
+        );
+
+        // Update proposal status
+        await pool.query(
+            `UPDATE campaign_proposals SET status = 'completed' WHERE id = $1`,
+            [campaign.proposal_id]
+        );
+
+        await pool.query("COMMIT");
+
+        // Notify creator
+        await createNotification(
+            creatorId,
+            'escrow_released',
+            'Payment Released!',
+            `The brand approved your delivery for "${campaign.title}". Kes. ${creatorCut.toLocaleString()} has been credited to your wallet.`,
+            { campaignId: parseInt(campaignId), amount: creatorCut }
+        );
+
+        res.json({ message: "Delivery approved and escrow released to creator!", creatorPayout: creatorCut });
+    } catch (error) {
+        await pool.query("ROLLBACK").catch(() => {});
+        console.error("Approve delivery error:", error);
+        res.status(500).json({ error: "Failed to release escrow", details: error.message });
+    }
+});
+
+// POST /api/campaigns/:id/rate — Rate & review the other party
+app.post("/api/campaigns/:id/rate", authenticateToken, async (req, res) => {
+    try {
+        const raterId = req.user.id;
+        const campaignId = req.params.id;
+        const { rating, review } = req.body;
+
+        const parsedRating = parseInt(rating);
+        if (isNaN(parsedRating) || parsedRating < 1 || parsedRating > 5) {
+            return res.status(400).json({ error: "Rating must be between 1 and 5" });
+        }
+
+        const campRes = await pool.query(
+            `SELECT c.business_id, cp.creator_id
+             FROM campaigns c
+             JOIN campaign_proposals cp ON c.selected_proposal_id = cp.id
+             WHERE c.id = $1 AND c.status = 'completed'`,
+            [campaignId]
+        );
+
+        if (campRes.rowCount === 0) {
+            return res.status(400).json({ error: "Completed campaign not found" });
+        }
+
+        const { business_id, creator_id } = campRes.rows[0];
+        let ratedId = null;
+
+        if (raterId === business_id) {
+            ratedId = creator_id;
+        } else if (raterId === creator_id) {
+            ratedId = business_id;
+        } else {
+            return res.status(403).json({ error: "You are not a participant in this campaign" });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO campaign_ratings (campaign_id, rater_id, rated_id, rating, review)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (campaign_id, rater_id, rated_id) DO UPDATE SET rating = $4, review = $5
+             RETURNING *`,
+            [campaignId, raterId, ratedId, parsedRating, review || null]
+        );
+
+        res.json({ message: "Rating submitted successfully", rating: result.rows[0] });
+    } catch (error) {
+        console.error("Rate campaign error:", error);
+        res.status(500).json({ error: "Failed to submit rating" });
+    }
+});
+
+// ========== NOTIFICATIONS API ==========
+
+// GET /api/notifications — Fetch user's notifications
+app.get("/api/notifications", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { limit = 30, offset = 0, unread_only = 'false' } = req.query;
+
+        let query = `SELECT * FROM notifications WHERE user_id = $1`;
+        const params = [userId];
+
+        if (unread_only === 'true') {
+            query += ` AND read = FALSE`;
+        }
+
+        query += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+        params.push(parseInt(limit), parseInt(offset));
+
+        const result = await pool.query(query, params);
+
+        // Get unread count
+        const unreadResult = await pool.query(
+            `SELECT COUNT(*) as count FROM notifications WHERE user_id = $1 AND read = FALSE`,
+            [userId]
+        );
+
+        res.json({
+            notifications: result.rows,
+            unreadCount: parseInt(unreadResult.rows[0].count)
+        });
+    } catch (error) {
+        console.error("Fetch notifications error:", error);
+        res.status(500).json({ error: "Failed to fetch notifications" });
+    }
+});
+
+// PUT /api/notifications/:id/read — Mark a notification as read
+app.put("/api/notifications/:id/read", authenticateToken, async (req, res) => {
+    try {
+        await pool.query(
+            `UPDATE notifications SET read = TRUE WHERE id = $1 AND user_id = $2`,
+            [req.params.id, req.user.id]
+        );
+        res.json({ message: "Notification marked as read" });
+    } catch (error) {
+        console.error("Mark notification read error:", error);
+        res.status(500).json({ error: "Failed to update notification" });
+    }
+});
+
+// PUT /api/notifications/read-all — Mark all notifications as read
+app.put("/api/notifications/read-all", authenticateToken, async (req, res) => {
+    try {
+        await pool.query(
+            `UPDATE notifications SET read = TRUE WHERE user_id = $1 AND read = FALSE`,
+            [req.user.id]
+        );
+        res.json({ message: "All notifications marked as read" });
+    } catch (error) {
+        console.error("Mark all notifications read error:", error);
+        res.status(500).json({ error: "Failed to update notifications" });
+    }
+});
+
+// ========== CO-HOST AUTO-EXPIRY CRON ==========
+
+// Run every 30 minutes — expire pending co-host requests older than 24 hours
+cron.schedule('*/30 * * * *', async () => {
+    try {
+        const result = await pool.query(`
+            UPDATE cohost_requests SET status = 'expired'
+            WHERE status = 'pending' AND expires_at < NOW()
+            RETURNING id, guest_id, host_id
+        `);
+
+        if (result.rowCount > 0) {
+            console.log(`⏰ Expired ${result.rowCount} co-host request(s)`);
+            for (const req of result.rows) {
+                await createNotification(
+                    req.guest_id,
+                    'cohost_request_expired',
+                    'Co-Post Request Expired',
+                    'Your co-post request has expired after 24 hours without a response from the host.',
+                    { requestId: req.id, hostId: req.host_id }
+                );
+            }
+        }
+    } catch (error) {
+        console.error('❌ Co-host auto-expiry cron error:', error);
+    }
+});
+
 // app.listen(port, () => {
 //     console.log(`🚀 Server running on port ${port}`);
 // });
@@ -5747,15 +7534,19 @@ app.get("/api/following/posts", authenticateToken, async (req, res) => {
                 p.id, p.type, p.title, p.caption, array_to_json(p.tags) AS tags,
                 p.images, p.video_url, p.audio_url, p.created_at, p.views,
                 p.duration, p.read_time, p.is_premium, p.visibility,
+                p.is_copost, p.cohost_host_id,
                 u.name AS creator_name, cp.profile_image AS creator_avatar,
+                hu.name AS host_name, hcp.profile_image AS host_avatar,
                 u.badge_level AS creator_badge_level,
                 COUNT(DISTINCT l.id) AS likes, COUNT(DISTINCT c.id) AS comments,
                 EXISTS(SELECT 1 FROM likes WHERE user_id = $1 AND post_id = p.id) AS is_liked,
                 EXISTS(SELECT 1 FROM bookmarks WHERE user_id = $1 AND post_id = p.id) AS is_bookmarked
             FROM posts p
-            JOIN followers f ON p.user_id = f.following_id
+            JOIN followers f ON (p.user_id = f.following_id OR p.cohost_host_id = f.following_id)
             JOIN users u ON p.user_id = u.id
             LEFT JOIN creators_page cp ON p.user_id = cp.user_id
+            LEFT JOIN users hu ON p.cohost_host_id = hu.id
+            LEFT JOIN creators_page hcp ON p.cohost_host_id = hcp.user_id
             LEFT JOIN likes l ON p.id = l.post_id
             LEFT JOIN comments c ON p.id = c.post_id
             WHERE f.follower_id = $1
@@ -5764,7 +7555,7 @@ app.get("/api/following/posts", authenticateToken, async (req, res) => {
               AND p.expires_at > NOW()
               AND p.visibility IN ('public', 'followers')
               AND p.is_premium = FALSE
-            GROUP BY p.id, u.name, cp.profile_image, u.badge_level
+            GROUP BY p.id, u.name, cp.profile_image, hu.name, hcp.profile_image, u.badge_level
             ORDER BY p.created_at DESC
             LIMIT $2 OFFSET $3
         `, [userId, parsedLimit, parsedOffset]);
@@ -5790,7 +7581,11 @@ app.get("/api/following/posts", authenticateToken, async (req, res) => {
             likes: parseInt(post.likes) || 0,
             comments: parseInt(post.comments) || 0,
             isLiked: post.is_liked,
-            isBookmarked: post.is_bookmarked
+            isBookmarked: post.is_bookmarked,
+            isCopost: post.is_copost || false,
+            cohostHostId: post.cohost_host_id || null,
+            hostName: post.host_name || null,
+            hostAvatar: post.host_avatar || null
         }));
 
         res.json({ posts });
