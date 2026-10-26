@@ -203,7 +203,23 @@ pool.connect((err) => {
             shares INTEGER DEFAULT 0,
             status VARCHAR(20) DEFAULT 'pending'
         )
-    `).then(() => console.log("Posts table ready"))
+    `).then(() => pool.query(`
+        ALTER TABLE posts
+            ADD COLUMN IF NOT EXISTS extended_days INTEGER NOT NULL DEFAULT 0;
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'posts'::regclass AND attname = 'expires_at' AND attgenerated <> ''
+            ) THEN
+                ALTER TABLE posts ALTER COLUMN expires_at DROP EXPRESSION;
+            END IF;
+        END $$;
+        ALTER TABLE posts
+            ALTER COLUMN expires_at SET DEFAULT (NOW() + INTERVAL '30 days');
+        UPDATE posts SET expires_at = created_at + INTERVAL '30 days'
+        WHERE extended_days = 0 AND expires_at <> created_at + INTERVAL '30 days';
+    `)).then(() => console.log("Posts table ready with 30-day expiry"))
       .catch(err => console.error("Error creating posts table:", err));
 
       // Creators Page table
@@ -639,12 +655,18 @@ pool.query(`
     CREATE TABLE IF NOT EXISTS cohost_settings (
         creator_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
         enabled BOOLEAN DEFAULT FALSE,
-        price INTEGER NOT NULL DEFAULT 299 CHECK (price >= 299),
-        max_daily_posts INTEGER DEFAULT 10,
+        price INTEGER NOT NULL DEFAULT 100 CHECK (price >= 100),
+        max_daily_posts INTEGER DEFAULT 5,
         description TEXT,
         updated_at TIMESTAMP DEFAULT NOW()
     )
-`).then(() => console.log("Co-host settings table ready"))
+`).then(() => pool.query(`
+    ALTER TABLE cohost_settings DROP CONSTRAINT IF EXISTS cohost_settings_price_check;
+    ALTER TABLE cohost_settings ALTER COLUMN price SET DEFAULT 100;
+    ALTER TABLE cohost_settings ALTER COLUMN max_daily_posts SET DEFAULT 5;
+    UPDATE cohost_settings SET max_daily_posts = 5 WHERE max_daily_posts IS DISTINCT FROM 5;
+    ALTER TABLE cohost_settings ADD CONSTRAINT cohost_settings_price_check CHECK (price >= 100);
+`)).then(() => console.log("Co-host settings table ready"))
   .catch(err => console.error("Error creating cohost_settings table:", err));
 
 // Co-Host Requests table — tracks co-post requests from Guest to Host
@@ -656,8 +678,10 @@ pool.query(`
         status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'expired', 'published')),
         price INTEGER NOT NULL,
         payment_method VARCHAR(20),
-        payment_status VARCHAR(20) DEFAULT 'pending' CHECK (payment_status IN ('pending', 'held', 'completed', 'refunded', 'failed')),
+        payment_status VARCHAR(20) DEFAULT 'pending' CHECK (payment_status IN ('pending', 'held', 'refunding', 'completed', 'refunded', 'failed')),
         mpesa_transaction_id VARCHAR(50),
+        mpesa_phone VARCHAR(20),
+        payment_reference VARCHAR(100),
         post_title VARCHAR(255),
         post_caption TEXT,
         post_type VARCHAR(50) DEFAULT 'text',
@@ -677,7 +701,19 @@ pool.query(`
         CREATE INDEX IF NOT EXISTS idx_cohost_requests_guest ON cohost_requests(guest_id);
         CREATE INDEX IF NOT EXISTS idx_cohost_requests_status ON cohost_requests(status);
     `);
-}).then(() => console.log("Co-host requests indexes ready"))
+}).then(() => pool.query(`
+    ALTER TABLE cohost_requests
+        ADD COLUMN IF NOT EXISTS mpesa_phone VARCHAR(20),
+        ADD COLUMN IF NOT EXISTS payment_reference VARCHAR(100);
+    ALTER TABLE cohost_requests DROP CONSTRAINT IF EXISTS cohost_requests_status_check;
+    ALTER TABLE cohost_requests DROP CONSTRAINT IF EXISTS cohost_requests_payment_status_check;
+    ALTER TABLE cohost_requests
+        ADD CONSTRAINT cohost_requests_status_check
+        CHECK (status IN ('pending', 'pending_approval', 'approved', 'rejected', 'expired', 'published'));
+    ALTER TABLE cohost_requests
+        ADD CONSTRAINT cohost_requests_payment_status_check
+        CHECK (payment_status IN ('pending', 'held', 'refunding', 'completed', 'refunded', 'failed'));
+`)).then(() => console.log("Co-host requests indexes and migrations ready"))
   .catch(err => console.error("Error creating cohost_requests table/indexes:", err));
 
 // Notifications table — persistent notification system
@@ -713,9 +749,65 @@ pool.query(`
 // Add account_type column to users table (for business accounts)
 pool.query(`
     ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS account_type VARCHAR(20) DEFAULT 'creator'
-`).then(() => console.log("Users table account_type column ready"))
-  .catch(err => console.error("Error adding account_type to users:", err));
+    ADD COLUMN IF NOT EXISTS account_type VARCHAR(20) DEFAULT 'creator',
+    ADD COLUMN IF NOT EXISTS username VARCHAR(30);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower
+    ON users (LOWER(username))
+    WHERE username IS NOT NULL
+`).then(() => console.log("Users account type and username schema ready"))
+  .catch(err => console.error("Error migrating users account type/username:", err));
+
+// Admin account access status
+pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS account_status VARCHAR(20) DEFAULT 'active',
+    ADD COLUMN IF NOT EXISTS account_status_reason TEXT,
+    ADD COLUMN IF NOT EXISTS account_status_updated_at TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS account_status_updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+
+    UPDATE users SET account_status = 'active' WHERE account_status IS NULL;
+
+    ALTER TABLE users ALTER COLUMN account_status SET DEFAULT 'active';
+    ALTER TABLE users ALTER COLUMN account_status SET NOT NULL;
+
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_account_status_check') THEN
+            ALTER TABLE users ADD CONSTRAINT users_account_status_check
+            CHECK (account_status IN ('active', 'suspended', 'closed'));
+        END IF;
+    END
+    $$;
+`).then(() => console.log("Users table account status columns ready"))
+  .catch(err => console.error("Error adding account status columns to users:", err));
+
+pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_users_account_status ON users(account_status);
+    CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
+    CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+`).then(() => console.log("Users admin lookup indexes ready"))
+  .catch(err => console.error("Error creating users admin lookup indexes:", err));
+
+// Admin audit log
+pool.query(`
+    CREATE TABLE IF NOT EXISTS admin_audit_log (
+        id BIGSERIAL PRIMARY KEY,
+        actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        action VARCHAR(100) NOT NULL,
+        target_type VARCHAR(50) NOT NULL,
+        target_id INTEGER,
+        reason TEXT,
+        before_state JSONB,
+        after_state JSONB,
+        request_id VARCHAR(100),
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_admin_audit_actor ON admin_audit_log(actor_id);
+    CREATE INDEX IF NOT EXISTS idx_admin_audit_target ON admin_audit_log(target_type, target_id);
+    CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit_log(created_at);
+`).then(() => console.log("Admin audit log table ready"))
+  .catch(err => console.error("Error creating admin audit log table:", err));
 
 // Business Profiles table
 pool.query(`
@@ -790,18 +882,149 @@ pool.query(`
 });
 
 // Middleware to verify JWT
-const authenticateToken = (req, res, next) => {
+const ACCOUNT_STATUS_CACHE_TTL_MS = 30 * 1000;
+const accountStatusCache = new Map();
+
+function setCachedAccountStatus(userId, status) {
+    if (accountStatusCache.size > 5000) {
+        const now = Date.now();
+        for (const [key, value] of accountStatusCache) {
+            if (value.expiresAt <= now) accountStatusCache.delete(key);
+        }
+    }
+    accountStatusCache.set(String(userId), {
+        status,
+        expiresAt: Date.now() + ACCOUNT_STATUS_CACHE_TTL_MS
+    });
+}
+
+async function getAccountStatus(userId) {
+    const key = String(userId);
+    const cached = accountStatusCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.status;
+
+    const result = await pool.query("SELECT account_status FROM users WHERE id = $1", [userId]);
+    const status = result.rowCount === 0 ? "missing" : (result.rows[0].account_status || "active");
+    setCachedAccountStatus(userId, status);
+    return status;
+}
+
+const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers.authorization || req.headers.Authorization;
     const token = authHeader && authHeader.split(" ")[1];
-    
+
     if (!token) return res.status(401).json({ error: "No token provided" });
+
+    let decoded;
     try {
-        const decoded = jwt.verify(token, secretKey);
-        req.user = decoded;
-        next();
+        decoded = jwt.verify(token, secretKey);
     } catch (error) {
         console.error("Token verification error:", error.message);
-        res.status(401).json({ error: "Invalid token", details: error.message });
+        return res.status(401).json({ error: "Invalid token", details: error.message });
+    }
+
+    if (!decoded || !decoded.id) {
+        return res.status(401).json({ error: "Invalid token" });
+    }
+
+    try {
+        const accountStatus = await getAccountStatus(decoded.id);
+        if (accountStatus === "missing") {
+            return res.status(401).json({ error: "Account not found" });
+        }
+        if (accountStatus !== "active") {
+            return res.status(403).json({
+                error: "Account access is restricted",
+                code: "ACCOUNT_RESTRICTED",
+                accountStatus
+            });
+        }
+    } catch (error) {
+        if (error.code !== "42703") {
+            console.error("Account status check error:", error);
+            return res.status(503).json({ error: "Unable to verify account status" });
+        }
+    }
+
+    req.user = decoded;
+    next();
+};
+
+const requireAccountType = (...allowedTypes) => async (req, res, next) => {
+    try {
+        const result = await pool.query(
+            "SELECT account_type FROM users WHERE id = $1",
+            [req.user.id]
+        );
+        if (result.rowCount === 0) {
+            return res.status(401).json({ error: "Account not found" });
+        }
+        const accountType = result.rows[0].account_type || "creator";
+        if (!allowedTypes.includes(accountType)) {
+            return res.status(403).json({
+                error: `This action is only available to ${allowedTypes.join(" or ")} accounts`,
+                code: "ACCOUNT_TYPE_NOT_ALLOWED"
+            });
+        }
+        req.user.accountType = accountType;
+        next();
+    } catch (error) {
+        console.error("Account type check error:", error);
+        res.status(503).json({ error: "Unable to verify account type" });
+    }
+};
+
+const ALL_ADMIN_PERMISSIONS = Object.freeze([
+    "accounts.read",
+    "accounts.status",
+    "moderation.read",
+    "moderation.decide",
+    "finance.read",
+    "finance.export",
+    "finance.action",
+    "staff.manage"
+]);
+
+const ROLE_PERMISSIONS = Object.freeze({
+    admin: ALL_ADMIN_PERMISSIONS,
+    moderator: Object.freeze(["moderation.read", "moderation.decide"])
+});
+
+function permissionsForRole(role) {
+    return ROLE_PERMISSIONS[role] || [];
+}
+
+const requirePermission = (permission) => async (req, res, next) => {
+    try {
+        const result = await pool.query(
+            "SELECT id, name, email, role FROM users WHERE id = $1",
+            [req.user.id]
+        );
+        if (result.rowCount === 0) {
+            return res.status(401).json({ error: "Account not found" });
+        }
+
+        const staff = result.rows[0];
+        const permissions = permissionsForRole(staff.role);
+        if (!permissions.includes(permission)) {
+            return res.status(403).json({
+                error: "You do not have permission to perform this action",
+                code: "PERMISSION_DENIED",
+                permission
+            });
+        }
+
+        req.staff = {
+            id: staff.id,
+            name: staff.name,
+            email: staff.email,
+            role: staff.role,
+            permissions
+        };
+        next();
+    } catch (error) {
+        console.error("Permission check error:", error);
+        res.status(503).json({ error: "Unable to verify permissions" });
     }
 };
 
@@ -822,153 +1045,241 @@ app.get("/verify-moderator", authenticateToken, async (req, res) => {
     }
 });
 
+const MODERATION_CONTENT_TYPES = Object.freeze(["image", "video", "audio", "article", "gallery"]);
+const MODERATION_REPORT_REASONS = Object.freeze([
+    "inappropriate",
+    "misleading",
+    "copyright",
+    "spam",
+    "harassment",
+    "hate_speech",
+    "privacy",
+    "other"
+]);
+
 // Fetch Moderation Posts
-app.get("/moderation/posts", authenticateToken, async (req, res) => {
-    const { status = "all", search = "", sort = "reports", limit = "20", offset = "0" } = req.query;
+app.get("/moderation/posts", authenticateToken, requirePermission("moderation.read"), async (req, res) => {
+    const status = typeof req.query.status === "string" ? req.query.status : "all";
+    const type = typeof req.query.type === "string" ? req.query.type : "all";
+    const reason = typeof req.query.reason === "string" ? req.query.reason : "all";
+    const search = typeof req.query.search === "string" ? req.query.search.trim().slice(0, 120) : "";
+    const sort = typeof req.query.sort === "string" ? req.query.sort : "reports";
+    const createdFrom = typeof req.query.created_from === "string" ? req.query.created_from : "";
+    const createdTo = typeof req.query.created_to === "string" ? req.query.created_to : "";
+    const limit = parseBoundedInt(req.query.limit, 20, 1, 100);
+    const offset = parseBoundedInt(req.query.offset, 0, 0, 1000000);
+
+    if (!["all", "pending", "approved", "flagged", "restricted"].includes(status)) {
+        return res.status(400).json({ error: "Invalid status filter" });
+    }
+    if (type !== "all" && !MODERATION_CONTENT_TYPES.includes(type)) {
+        return res.status(400).json({ error: "Invalid content type filter" });
+    }
+    if (reason !== "all" && !MODERATION_REPORT_REASONS.includes(reason)) {
+        return res.status(400).json({ error: "Invalid report reason filter" });
+    }
+    if (!["reports", "newest", "views", "risk"].includes(sort)) {
+        return res.status(400).json({ error: "Invalid sort option" });
+    }
+    if (createdFrom && !isValidDateOnly(createdFrom)) {
+        return res.status(400).json({ error: "Invalid created_from date" });
+    }
+    if (createdTo && !isValidDateOnly(createdTo)) {
+        return res.status(400).json({ error: "Invalid created_to date" });
+    }
+    if (createdFrom && createdTo && createdFrom > createdTo) {
+        return res.status(400).json({ error: "created_from must be before created_to" });
+    }
+    if (limit === null) {
+        return res.status(400).json({ error: "Limit must be between 1 and 100" });
+    }
+    if (offset === null) {
+        return res.status(400).json({ error: "Offset is invalid" });
+    }
 
     try {
-        // Verify moderator role
-        const userResult = await pool.query(
-            "SELECT id FROM users WHERE id = $1 AND role IN ('moderator', 'admin')",
-            [req.user.id]
-        );
-        if (userResult.rowCount === 0) {
-            return res.status(403).json({ error: "Unauthorized: Moderator access required" });
-        }
-
-        const parsedLimit = parseInt(limit);
-        const parsedOffset = parseInt(offset);
-        if (isNaN(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) {
-            return res.status(400).json({ error: "Limit must be between 1 and 100" });
-        }
-        if (isNaN(parsedOffset) || parsedOffset < 0) {
-            return res.status(400).json({ error: "Offset must be non-negative" });
-        }
-
-        let query = `
-            SELECT 
-                p.id, p.user_id AS creator_id, p.type, p.title, p.caption, array_to_json(p.tags) AS tags,
-                p.images, p.video_url, p.audio_url, p.created_at, p.status, p.views,
-                p.duration, p.read_time, u.name AS creator_name, cp.profile_image AS creator_avatar, u.badge_level AS creator_badge_level,
-                COUNT(DISTINCT l.id) AS likes, COUNT(DISTINCT c.id) AS comments,
-                COUNT(DISTINCT r.id) AS report_count,
-                array_agg(DISTINCT r.reason) AS report_reasons
-            FROM posts p
-            LEFT JOIN users u ON p.user_id = u.id
-            LEFT JOIN creators_page cp ON p.user_id = cp.user_id
-            LEFT JOIN likes l ON p.id = l.post_id
-            LEFT JOIN comments c ON p.id = c.post_id
-            LEFT JOIN reports r ON p.id = r.post_id
-            WHERE p.is_draft = FALSE AND p.expires_at > NOW()
-        `;
+        const baseConditions = ["p.is_draft = FALSE", "p.expires_at > NOW()"];
         const params = [];
+        const conditions = [...baseConditions];
+        const countsParams = [];
+        const countsConditions = [...baseConditions];
 
         if (status !== "all") {
-            query += ` AND p.status = $${params.length + 1}`;
             params.push(status);
+            conditions.push(`p.status = $${params.length}`);
         }
-        if (search.trim()) {
-            query += ` AND (p.title ILIKE $${params.length + 1} OR u.name ILIKE $${params.length + 1})`;
-            params.push(`%${search.trim()}%`);
+        if (type !== "all") {
+            params.push(type);
+            conditions.push(`p.type = $${params.length}`);
+            countsParams.push(type);
+            countsConditions.push(`p.type = $${countsParams.length}`);
+        }
+        if (reason !== "all") {
+            params.push(reason);
+            conditions.push(`EXISTS (
+                SELECT 1 FROM reports rr
+                WHERE rr.post_id = p.id AND rr.reason::text = $${params.length}
+            )`);
+            countsParams.push(reason);
+            countsConditions.push(`EXISTS (
+                SELECT 1 FROM reports cr
+                WHERE cr.post_id = p.id AND cr.reason::text = $${countsParams.length}
+            )`);
+        }
+        if (search) {
+            const pattern = `%${escapeLikeValue(search)}%`;
+            params.push(pattern);
+            conditions.push(`(p.title ILIKE $${params.length} OR u.name ILIKE $${params.length})`);
+            countsParams.push(pattern);
+            countsConditions.push(`(p.title ILIKE $${countsParams.length} OR u.name ILIKE $${countsParams.length})`);
+        }
+        if (createdFrom) {
+            params.push(createdFrom);
+            conditions.push(`p.created_at >= $${params.length}::date`);
+            countsParams.push(createdFrom);
+            countsConditions.push(`p.created_at >= $${countsParams.length}::date`);
+        }
+        if (createdTo) {
+            params.push(createdTo);
+            conditions.push(`p.created_at < ($${params.length}::date + INTERVAL '1 day')`);
+            countsParams.push(createdTo);
+            countsConditions.push(`p.created_at < ($${countsParams.length}::date + INTERVAL '1 day')`);
         }
 
-        query += `
-            GROUP BY p.id, p.user_id, p.type, p.title, p.caption, p.images, p.video_url, p.audio_url, p.created_at, p.status, p.views,
-                     p.duration, p.read_time, u.name, cp.profile_image, u.badge_level
-        `;
+        const whereClause = `WHERE ${conditions.join(" AND ")}`;
+        const countsWhereClause = `WHERE ${countsConditions.join(" AND ")}`;
+        const orderBy = {
+            reports: "report_count DESC, p.created_at DESC, p.id DESC",
+            newest: "p.created_at DESC, p.id DESC",
+            views: "p.views DESC, p.created_at DESC, p.id DESC",
+            risk: "(COUNT(DISTINCT r.id) * 10 + CASE WHEN COALESCE(bool_or(r.reason IN ('harassment', 'hate_speech')), FALSE) THEN 30 ELSE 0 END) DESC, p.created_at DESC, p.id DESC"
+        }[sort];
 
-        switch (sort) {
-            case "reports":
-                query += " ORDER BY report_count DESC, p.created_at DESC";
-                break;
-            case "newest":
-                query += " ORDER BY p.created_at DESC";
-                break;
-            case "views":
-                query += " ORDER BY p.views DESC";
-                break;
-            case "risk":
-                query += " ORDER BY (COUNT(r.id) * 10 + CASE WHEN ARRAY['harassment', 'hate_speech'] && array_agg(r.reason) THEN 30 ELSE 0 END) DESC, p.created_at DESC";
-                break;
-            default:
-                query += " ORDER BY p.created_at DESC";
-        }
+        const result = await pool.query(
+            `SELECT
+                p.id, p.user_id AS creator_id, p.type, p.title, p.caption,
+                array_to_json(p.tags) AS tags, p.images, p.video_url, p.audio_url,
+                p.created_at, p.status, p.views, p.duration, p.read_time,
+                u.name AS creator_name, u.username AS creator_username, cp.profile_image AS creator_avatar,
+                u.badge_level AS creator_badge_level,
+                COUNT(DISTINCT l.id)::int AS likes,
+                COUNT(DISTINCT c.id)::int AS comments,
+                COUNT(DISTINCT r.id)::int AS report_count,
+                COALESCE(array_remove(array_agg(DISTINCT r.reason::text), NULL::text), ARRAY[]::text[]) AS report_reasons,
+                (SELECT rr.message FROM reports rr
+                 WHERE rr.post_id = p.id
+                 ORDER BY rr.timestamp DESC NULLS LAST, rr.id DESC LIMIT 1) AS latest_report_message,
+                (SELECT rr.timestamp FROM reports rr
+                 WHERE rr.post_id = p.id
+                 ORDER BY rr.timestamp DESC NULLS LAST, rr.id DESC LIMIT 1) AS latest_report_at
+             FROM posts p
+             LEFT JOIN users u ON p.user_id = u.id
+             LEFT JOIN creators_page cp ON p.user_id = cp.user_id
+             LEFT JOIN likes l ON p.id = l.post_id
+             LEFT JOIN comments c ON p.id = c.post_id
+             LEFT JOIN reports r ON p.id = r.post_id
+             ${whereClause}
+             GROUP BY p.id, p.user_id, p.type, p.title, p.caption, p.images, p.video_url, p.audio_url,
+                      p.created_at, p.status, p.views, p.duration, p.read_time,
+                      u.name, cp.profile_image, u.badge_level
+             ORDER BY ${orderBy}
+             LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+            [...params, limit, offset]
+        );
 
-        query += ` LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-        params.push(parsedLimit, parsedOffset);
+        const posts = result.rows.map((post) => {
+            const reportReasons = Array.isArray(post.report_reasons)
+                ? post.report_reasons.filter(Boolean)
+                : [];
+            const reportCount = post.report_count || 0;
+            const riskScore = Math.min(
+                reportCount * 10 + (reportReasons.includes("harassment") || reportReasons.includes("hate_speech") ? 30 : 0),
+                100
+            );
 
-        const result = await pool.query(query, params);
-        const posts = result.rows.map(post => ({
-            id: post.id,
-            creatorId: post.creator_id,
-            type: post.type,
-            title: post.title,
-            caption: post.caption,
-            tags: post.tags,
-            images: post.images,
-            video_url: post.video_url,
-            audio_url: post.audio_url,
-            created_at: post.created_at,
-            status: post.status,
-            creatorName: post.creator_name,
-            creatorAvatar: post.creator_avatar || "https://placehold.co/40x40",
-            creatorBadgeLevel: post.creator_badge_level || 0,
-            likes: parseInt(post.likes) || 0,
-            comments: parseInt(post.comments) || 0,
-            views: parseInt(post.views) || 0,
-            reportCount: parseInt(post.report_count) || 0,
-            reportReasons: post.report_reasons.filter(r => r !== null) || [],
-            duration: post.duration,
-            read_time: post.read_time,
-            creatorScore: Math.max(100 - post.report_count * 5, 0), // Placeholder: Decrease score based on reports
-            riskScore: Math.min(post.report_count * 10 + (post.report_reasons.includes('harassment') || post.report_reasons.includes('hate_speech') ? 30 : 0), 100), // Placeholder: Based on report count and severity
-            contentFlags: post.report_reasons.includes('hate_speech') ? ['potentially-controversial'] : [] // Placeholder: Flag based on report reasons
-        }));
+            return {
+                id: post.id,
+                creatorId: post.creator_id,
+                type: post.type,
+                title: post.title,
+                caption: post.caption,
+                tags: Array.isArray(post.tags) ? post.tags : [],
+                images: Array.isArray(post.images) ? post.images : [],
+                video_url: post.video_url,
+                audio_url: post.audio_url,
+                created_at: post.created_at,
+                status: post.status,
+                creatorName: post.creator_name,
+                creatorAvatar: post.creator_avatar || null,
+                creatorBadgeLevel: post.creator_badge_level || 0,
+                likes: post.likes || 0,
+                comments: post.comments || 0,
+                views: post.views || 0,
+                reportCount,
+                reportReasons,
+                latestReportMessage: post.latest_report_message || "",
+                latestReportAt: post.latest_report_at || null,
+                duration: post.duration,
+                read_time: post.read_time,
+                creatorScore: Math.max(100 - reportCount * 5, 0),
+                riskScore,
+                contentFlags: reportReasons.includes("hate_speech") ? ["potentially-controversial"] : []
+            };
+        });
 
-        const totalQuery = `
-            SELECT COUNT(DISTINCT p.id)
-            FROM posts p
-            LEFT JOIN users u ON p.user_id = u.id
-            WHERE p.is_draft = FALSE AND p.expires_at > NOW()
-            ${status !== "all" ? `AND p.status = $1` : ""}
-            ${search.trim() ? `AND (p.title ILIKE $2 OR u.name ILIKE $2)` : ""}
-        `;
-        const totalParams = status !== "all" ? [status] : [];
-        if (search.trim()) totalParams.push(`%${search.trim()}%`);
-        const totalResult = await pool.query(totalQuery, totalParams);
+        const totalResult = await pool.query(
+            `SELECT COUNT(*)::int AS total
+             FROM posts p
+             LEFT JOIN users u ON p.user_id = u.id
+             ${whereClause}`,
+            params
+        );
+        const total = totalResult.rows[0].total;
+
+        const countsResult = await pool.query(
+            `SELECT p.status, COUNT(*)::int AS count
+             FROM posts p
+             LEFT JOIN users u ON p.user_id = u.id
+             ${countsWhereClause}
+             GROUP BY p.status`,
+            countsParams
+        );
+        const statusCounts = { pending: 0, approved: 0, flagged: 0, restricted: 0 };
+        countsResult.rows.forEach((row) => {
+            if (Object.prototype.hasOwnProperty.call(statusCounts, row.status)) {
+                statusCounts[row.status] = row.count;
+            }
+        });
 
         res.json({
             posts,
+            statusCounts,
             pagination: {
-                limit: parsedLimit,
-                offset: parsedOffset,
-                total: parseInt(totalResult.rows[0].count)
+                limit,
+                offset,
+                total,
+                page: Math.floor(offset / limit) + 1,
+                pages: total === 0 ? 0 : Math.ceil(total / limit)
             }
         });
     } catch (error) {
         console.error("Moderation posts fetch error:", error);
-        res.status(500).json({ error: "Failed to fetch moderation posts", details: error.message });
+        res.status(500).json({ error: "Failed to fetch moderation posts" });
     }
 });
 
 // Fetch Reports for a Post
-app.get("/posts/:postId/reports", authenticateToken, async (req, res) => {
-    const postId = parseInt(req.params.postId);
+app.get("/posts/:postId/reports", authenticateToken, requirePermission("moderation.read"), async (req, res) => {
+    const postIdText = String(req.params.postId);
+    if (!/^\d+$/.test(postIdText)) {
+        return res.status(400).json({ error: "Invalid post ID" });
+    }
+    const postId = Number.parseInt(postIdText, 10);
+    if (!Number.isInteger(postId) || postId <= 0) {
+        return res.status(400).json({ error: "Invalid post ID" });
+    }
 
     try {
-        // Verify moderator role
-        const userResult = await pool.query(
-            "SELECT id FROM users WHERE id = $1 AND role IN ('moderator', 'admin')",
-            [req.user.id]
-        );
-        if (userResult.rowCount === 0) {
-            return res.status(403).json({ error: "Unauthorized: Moderator access required" });
-        }
-
-        if (isNaN(postId)) {
-            return res.status(400).json({ error: "Invalid post ID" });
-        }
-
         const result = await pool.query(
             `SELECT id AS report_id, post_id, reason, message, timestamp, status
              FROM reports
@@ -992,87 +1303,215 @@ app.get("/posts/:postId/reports", authenticateToken, async (req, res) => {
 });
 
 // Update Post Status
-app.patch("/posts/:postId/status", authenticateToken, async (req, res) => {
-    const postId = parseInt(req.params.postId);
-    const { status, reason, comment } = req.body;
+app.patch("/posts/:postId/status", authenticateToken, requirePermission("moderation.decide"), async (req, res) => {
+    const postIdText = String(req.params.postId);
+    if (!/^\d+$/.test(postIdText)) {
+        return res.status(400).json({ error: "Invalid post ID" });
+    }
+    const postId = Number.parseInt(postIdText, 10);
+    if (!Number.isInteger(postId) || postId <= 0) {
+        return res.status(400).json({ error: "Invalid post ID" });
+    }
 
+    const status = typeof req.body?.status === "string" ? req.body.status.trim() : "";
+    const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+    const comment = typeof req.body?.comment === "string" ? req.body.comment.trim() : "";
+    const validStatuses = ["pending", "approved", "flagged", "restricted"];
+
+    if (!validStatuses.includes(status)) {
+        return res.status(400).json({ error: "Invalid status. Must be one of: " + validStatuses.join(", ") });
+    }
+    if (status === "flagged" && !reason) {
+        return res.status(400).json({ error: "Reason is required for flagging" });
+    }
+    if (reason.length > 50) {
+        return res.status(400).json({ error: "Reason must be 50 characters or fewer" });
+    }
+    if (comment.length > 2000) {
+        return res.status(400).json({ error: "Comment must be 2000 characters or fewer" });
+    }
+
+    let client;
     try {
-        // Verify moderator role
-        const userResult = await pool.query(
-            "SELECT id FROM users WHERE id = $1 AND role IN ('moderator', 'admin')",
-            [req.user.id]
-        );
-        if (userResult.rowCount === 0) {
-            return res.status(403).json({ error: "Unauthorized: Moderator access required" });
-        }
+        client = await pool.connect();
+        await client.query("BEGIN");
 
-        if (isNaN(postId)) {
-            return res.status(400).json({ error: "Invalid post ID" });
-        }
-
-        const validStatuses = ["pending", "approved", "flagged", "restricted"];
-        if (!validStatuses.includes(status)) {
-            return res.status(400).json({ error: "Invalid status. Must be one of: " + validStatuses.join(", ") });
-        }
-
-        if (status === "flagged" && !reason) {
-            return res.status(400).json({ error: "Reason is required for flagging" });
-        }
-
-        // Start transaction
-        await pool.query("BEGIN");
-
-        // Update post status
-        const postResult = await pool.query(
-            `UPDATE posts SET status = $1 WHERE id = $2 RETURNING id, status`,
-            [status, postId]
+        const postResult = await client.query(
+            `SELECT id, user_id, status
+             FROM posts
+             WHERE id = $1
+             FOR UPDATE`,
+            [postId]
         );
         if (postResult.rowCount === 0) {
-            await pool.query("ROLLBACK");
+            await client.query("ROLLBACK");
             return res.status(404).json({ error: "Post not found" });
         }
 
-        // Update reports status if resolved
+        const current = postResult.rows[0];
+        const beforeState = { status: current.status };
+
+        if (current.status !== status) {
+            await client.query(
+                "UPDATE posts SET status = $1 WHERE id = $2",
+                [status, postId]
+            );
+        }
+
+        let resolvedReports = 0;
         if (status === "approved" || status === "restricted") {
-            await pool.query(
-                "UPDATE reports SET status = 'resolved' WHERE post_id = $1",
+            const resolved = await client.query(
+                "UPDATE reports SET status = 'resolved' WHERE post_id = $1 AND status <> 'resolved'",
                 [postId]
             );
+            resolvedReports = resolved.rowCount;
         }
 
-        // Store moderation comment if provided
         if (comment) {
-            await pool.query(
+            await client.query(
                 `INSERT INTO moderation_comments (post_id, moderator_id, comment)
                  VALUES ($1, $2, $3)`,
-                [postId, req.user.id, comment.trim()]
+                [postId, req.staff.id, comment]
             );
         }
 
-        // If flagged, add a report entry for moderator's action
+        let flaggedReportId = null;
         if (status === "flagged" && reason) {
-            await pool.query(
+            const flagged = await client.query(
                 `INSERT INTO reports (post_id, creator_id, reporter_id, reason, message, timestamp, status)
-                 VALUES ($1, (SELECT user_id FROM posts WHERE id = $1), $2, $3, $4, NOW(), 'pending')`,
-                [postId, req.user.id, reason, comment || "Moderator flagged"]
+                 VALUES ($1, $2, $3, $4, $5, NOW(), 'pending')
+                 ON CONFLICT (post_id, reporter_id) DO UPDATE
+                 SET reason = EXCLUDED.reason,
+                     message = EXCLUDED.message,
+                     timestamp = NOW(),
+                     status = 'pending'
+                 RETURNING id`,
+                [postId, current.user_id, req.staff.id, reason, comment || "Moderator flagged"]
             );
+            flaggedReportId = flagged.rows[0].id;
         }
 
-        await pool.query("COMMIT");
+        const requestId = getRequestId(req);
+        const afterState = {
+            status,
+            resolvedReports,
+            flaggedReportId
+        };
 
-        res.json({ message: `Post ${status} successfully`, postId });
+        await client.query(
+            `INSERT INTO admin_audit_log
+                (actor_id, action, target_type, target_id, reason, before_state, after_state, request_id)
+             VALUES ($1, 'moderation.post.status', 'post', $2, $3, $4::jsonb, $5::jsonb, $6)`,
+            [
+                req.staff.id,
+                postId,
+                reason || comment || null,
+                JSON.stringify(beforeState),
+                JSON.stringify(afterState),
+                requestId
+            ]
+        );
+
+        await client.query("COMMIT");
+
+        res.json({
+            message: `Post ${status} successfully`,
+            postId,
+            status,
+            previousStatus: current.status,
+            resolvedReports,
+            audit: { requestId }
+        });
     } catch (error) {
-        await pool.query("ROLLBACK");
+        if (client) {
+            try {
+                await client.query("ROLLBACK");
+            } catch (rollbackError) {
+                console.error("Moderation rollback error:", rollbackError.message);
+            }
+        }
         console.error("Update post status error:", error);
-        res.status(500).json({ error: "Failed to update post status", details: error.message });
+        res.status(500).json({ error: "Failed to update post status" });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+app.get("/api/admin/posts/:postId/audit", authenticateToken, requirePermission("moderation.read"), async (req, res) => {
+    const postIdText = String(req.params.postId);
+    if (!/^\d+$/.test(postIdText)) {
+        return res.status(400).json({ error: "Invalid post ID" });
+    }
+    const postId = Number.parseInt(postIdText, 10);
+    if (!Number.isInteger(postId) || postId <= 0) {
+        return res.status(400).json({ error: "Invalid post ID" });
+    }
+
+    const limit = parseBoundedInt(req.query.limit, 20, 1, 100);
+    const offset = parseBoundedInt(req.query.offset, 0, 0, 1000000);
+    if (limit === null) {
+        return res.status(400).json({ error: "Limit must be between 1 and 100" });
+    }
+    if (offset === null) {
+        return res.status(400).json({ error: "Offset is invalid" });
+    }
+
+    try {
+        const exists = await pool.query("SELECT 1 FROM posts WHERE id = $1", [postId]);
+        if (exists.rowCount === 0) {
+            return res.status(404).json({ error: "Post not found" });
+        }
+
+        const countResult = await pool.query(
+            `SELECT COUNT(*)::int AS total
+             FROM admin_audit_log
+             WHERE target_type = 'post' AND target_id = $1`,
+            [postId]
+        );
+        const total = countResult.rows[0].total;
+
+        const result = await pool.query(
+            `SELECT
+                a.id, a.action, a.reason, a.before_state, a.after_state, a.request_id, a.created_at,
+                a.actor_id, u.name AS actor_name, u.email AS actor_email
+             FROM admin_audit_log a
+             LEFT JOIN users u ON u.id = a.actor_id
+             WHERE a.target_type = 'post' AND a.target_id = $1
+             ORDER BY a.created_at DESC, a.id DESC
+             LIMIT $2 OFFSET $3`,
+            [postId, limit, offset]
+        );
+
+        res.json({
+            items: result.rows.map((row) => ({
+                id: row.id,
+                action: row.action,
+                reason: row.reason,
+                beforeState: row.before_state,
+                afterState: row.after_state,
+                requestId: row.request_id,
+                createdAt: row.created_at,
+                actor: row.actor_name
+                    ? { id: row.actor_id, name: row.actor_name, email: row.actor_email }
+                    : null
+            })),
+            pagination: {
+                limit,
+                offset,
+                total,
+                page: Math.floor(offset / limit) + 1,
+                pages: total === 0 ? 0 : Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        console.error("Admin post audit error:", error);
+        res.status(500).json({ error: "Failed to load post decision history" });
     }
 });
 
 // Get M-Pesa OAuth Token
 async function getAccessToken() {
     try {
-        console.log("Consumer Key:", process.env.MPESA_CONSUMER_KEY);
-        console.log("Consumer Secret:", process.env.MPESA_CONSUMER_SECRET);
         console.log("M-Pesa Environment:", process.env.MPESA_ENV);
         const response = await axios.get(
             process.env.MPESA_ENV === 'production'
@@ -1085,7 +1524,6 @@ async function getAccessToken() {
                 }
             }
         );
-        console.log("OAuth Response:", JSON.stringify(response.data, null, 2));
         return response.data.access_token;
     } catch (error) {
         console.error("Access Token Error:", error.response?.data || error.message);
@@ -1124,7 +1562,7 @@ app.post("/api/mpesa/stkpush", authenticateToken, async (req, res) => {
         console.log("✅ Subscription confirmed. Fetching access token...");
 
         const token = await getAccessToken();
-        console.log("🔐 Access token acquired:", token);
+        console.log("🔐 Access token acquired");
 
         const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
         console.log("🕒 Timestamp:", timestamp);
@@ -1470,6 +1908,8 @@ app.post("/subscribe", authenticateToken, async (req, res) => {
 // Signup
 app.post("/signup", async (req, res) => {
     const { name, email, password, moderatorId, moderator, role, referralCode, accountType, companyName, industry } = req.body;
+    let client;
+    let transactionStarted = false;
 
     try {
         if (!name || !email || !password) {
@@ -1502,6 +1942,24 @@ app.post("/signup", async (req, res) => {
         const validRoles = ["user", "moderator", "admin"];
         const finalRole = validRoles.includes(role) ? role : "user";
         const finalAccountType = accountType === 'business' ? 'business' : 'creator';
+        const requestedUsername = typeof req.body.username === "string"
+            ? req.body.username.trim().toLowerCase()
+            : "";
+        if (finalAccountType === "creator" && requestedUsername && !/^[a-z0-9_]{3,30}$/.test(requestedUsername)) {
+            return res.status(400).json({ error: "Username must be 3 to 30 characters using letters, numbers, and underscores" });
+        }
+        if (finalAccountType === "business" && requestedUsername) {
+            return res.status(400).json({ error: "Usernames are available for Creator accounts only" });
+        }
+        if (requestedUsername) {
+            const usernameExists = await pool.query(
+                "SELECT 1 FROM users WHERE LOWER(username) = $1",
+                [requestedUsername]
+            );
+            if (usernameExists.rowCount > 0) {
+                return res.status(409).json({ error: "That username is already taken" });
+            }
+        }
 
         const sequenceResult = await pool.query(
             "SELECT nextval('user_moderation_seq') AS seq"
@@ -1517,16 +1975,18 @@ app.post("/signup", async (req, res) => {
         }
 
         // === START TRANSACTION: Create user + profile atomically ===
-        await pool.query("BEGIN");
+        client = await pool.connect();
+        await client.query("BEGIN");
+        transactionStarted = true;
 
         // 1. Create user
-        const userResult = await pool.query(
+        const userResult = await client.query(
             `INSERT INTO users (
                 name, email, password, moderator_id, moderator, 
-                user_moderation_id, role, is_creator, referred_by, account_type
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-             RETURNING id, name, email, moderator_id, moderator, user_moderation_id, role, account_type`,
-            [name.trim(), email.toLowerCase(), hashedPassword, finalModeratorId, moderator || '', userModerationId, finalRole, finalAccountType === 'creator', referredBy, finalAccountType]
+                user_moderation_id, role, is_creator, referred_by, account_type, username
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             RETURNING id, name, email, moderator_id, moderator, user_moderation_id, role, account_type, username`,
+            [name.trim(), email.toLowerCase(), hashedPassword, finalModeratorId, moderator || '', userModerationId, finalRole, finalAccountType === 'creator', referredBy, finalAccountType, requestedUsername || null]
         );
 
         const user = userResult.rows[0];
@@ -1536,7 +1996,7 @@ app.post("/signup", async (req, res) => {
 
         if (finalAccountType === 'business') {
             // Create business profile
-            await pool.query(
+            await client.query(
                 `INSERT INTO business_profiles (user_id, company_name, industry, created_at)
                  VALUES ($1, $2, $3, NOW())
                  ON CONFLICT (user_id) DO NOTHING`,
@@ -1544,7 +2004,7 @@ app.post("/signup", async (req, res) => {
             );
         } else {
             // 2. Automatically create creators_page entry
-            await pool.query(
+            await client.query(
                 `INSERT INTO creators_page (user_id, profile_image, bio, socials, updated_at)
                  VALUES ($1, $2, $3, $4, NOW())
                  ON CONFLICT (user_id) DO NOTHING`,
@@ -1560,7 +2020,7 @@ app.post("/signup", async (req, res) => {
         // Assign default subscription tiers for new creators if they don't already have any
         if (finalAccountType !== 'business') {
         try {
-            const existingTiers = await pool.query(
+            const existingTiers = await client.query(
                 `SELECT COUNT(*) FROM subscription_tiers WHERE creator_id = $1`,
                 [user.id]
             );
@@ -1583,7 +2043,7 @@ app.post("/signup", async (req, res) => {
                 ];
 
                 for (const tier of defaultTiers) {
-                    await pool.query(
+                    await client.query(
                         `INSERT INTO subscription_tiers (creator_id, name, price, interval, description, features)
                          VALUES ($1, $2, $3, $4, $5, $6)
                          ON CONFLICT DO NOTHING`,
@@ -1600,29 +2060,40 @@ app.post("/signup", async (req, res) => {
         }
         }
 
-        await pool.query("COMMIT");
+        await client.query("COMMIT");
+        transactionStarted = false;
+        client.release();
+        client = null;
 
-        console.log(`New creator signed up: ${name} (${email}) → ID: ${user.id}`);
+        console.log(`New ${finalAccountType} account signed up: ${name} (${email}) → ID: ${user.id}`);
 
         res.status(201).json({
-            message: "Account created successfully! You are now a creator.",
+            message: finalAccountType === "creator"
+                ? "Account created successfully! You are now a creator."
+                : "Business account created successfully.",
             user: {
                 id: user.id,
                 name: user.name,
                 email: user.email,
-                isCreator: true,
+                username: user.username || null,
+                accountType: user.account_type,
+                isCreator: finalAccountType === "creator",
                 role: user.role
             }
         });
 
     } catch (error) {
-        await pool.query("ROLLBACK");
-        if (error.code === "23505") {
+        if (transactionStarted && client) await client.query("ROLLBACK").catch(() => {});
+        if (error.code === "23505" && String(error.constraint || "").includes("username")) {
+            res.status(409).json({ error: "That username is already taken" });
+        } else if (error.code === "23505") {
             res.status(400).json({ error: "Email already exists" });
         } else {
             console.error("Signup error:", error);
             res.status(500).json({ error: "Server error", details: error.message });
         }
+    } finally {
+        if (client) client.release();
     }
 });
 
@@ -1645,6 +2116,13 @@ app.post("/login", async (req, res) => {
         if (!validPassword) {
             return res.status(400).json({ error: "Invalid email or password" });
         }
+        if (user.account_status && user.account_status !== "active") {
+            return res.status(403).json({
+                error: "This account is currently restricted. Please contact support.",
+                code: "ACCOUNT_RESTRICTED",
+                accountStatus: user.account_status
+            });
+        }
         const token = jwt.sign({ id: user.id, email: user.email, role: user.role, accountType: user.account_type || 'creator' }, secretKey, { expiresIn: "7d" });
         res.json({
             message: "Login successful",
@@ -1657,6 +2135,7 @@ app.post("/login", async (req, res) => {
                 accountType: user.account_type || 'creator',
                 account_type: user.account_type || 'creator',
                 isCreator: user.account_type !== 'business' && (user.is_creator || false),
+                username: user.username || null,
                 companyName: user.company_name || null,
                 credits: user.credits || 0
             }
@@ -1712,7 +2191,7 @@ app.post("/forgot-password", async (req, res) => {
 // Reset Password
 app.post("/api/auth/reset-password", async (req, res) => {
     const { token, newPassword } = req.body;
-    console.log(`[Reset Password] Request received with token: ${token.substring(0, 8)}...`);
+    console.log("[Reset Password] Request received");
     try {
         const result = await pool.query("SELECT * FROM password_resets WHERE token = $1 AND expires_at > NOW()", [token]);
         if (result.rowCount === 0) {
@@ -1766,6 +2245,7 @@ app.get("/verify", authenticateToken, async (req, res) => {
           u.badge_level,
           u.badge_downgrade_start,
           u.account_type,
+          u.username,
           u.credits,
           cp.profile_image,
           cp.bio AS creator_bio,
@@ -1804,6 +2284,7 @@ app.get("/verify", authenticateToken, async (req, res) => {
         isCreator: !isBusiness && (!!row.is_creator || !!row.profile_image),
         accountType: row.account_type || 'creator',
         account_type: row.account_type || 'creator',
+        username: row.username || null,
         companyName: row.company_name || null,
         industry: row.industry || null,
         credits: row.credits || 0,
@@ -1826,33 +2307,57 @@ app.get("/verify", authenticateToken, async (req, res) => {
 // PUT /profile — Safe profile update (email NEVER updated here)
 app.put("/profile", authenticateToken, async (req, res) => {
   const userId = req.user.id;
-  const { name, bio, categories, profile_image } = req.body;
+  const { name, bio, categories, profile_image, username } = req.body;
+  let client;
+  let transactionStarted = false;
 
   try {
+    const usernameWasProvided = Object.prototype.hasOwnProperty.call(req.body, "username");
+    let normalizedUsername = null;
+    if (usernameWasProvided) {
+      const accountResult = await pool.query(
+        "SELECT account_type FROM users WHERE id = $1",
+        [userId]
+      );
+      if (accountResult.rowCount === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+      if ((accountResult.rows[0].account_type || "creator") !== "creator") {
+        return res.status(403).json({ error: "Usernames are available for Creator accounts only" });
+      }
+      normalizedUsername = typeof username === "string" ? username.trim().toLowerCase() : "";
+      if (normalizedUsername && !/^[a-z0-9_]{3,30}$/.test(normalizedUsername)) {
+        return res.status(400).json({ error: "Username must be 3 to 30 characters using letters, numbers, and underscores" });
+      }
+      normalizedUsername = normalizedUsername || null;
+    }
+
     // Start transaction — update both users and creators_page safely
-    await pool.query("BEGIN");
+    client = await pool.connect();
+    await client.query("BEGIN");
+    transactionStarted = true;
 
     // 1. Update users table (only safe fields — email is intentionally excluded)
-    const userUpdate = await pool.query(
+    const userUpdate = await client.query(
       `UPDATE users 
        SET name = COALESCE($1, name),
            bio = COALESCE($2, bio),
-           categories = COALESCE($3, categories)
+           categories = COALESCE($3, categories),
+           username = CASE WHEN $5 THEN $6 ELSE username END
        WHERE id = $4
-       RETURNING id, name, email, bio, categories, role`,
-      [name || null, bio || null, categories || null, userId]
+       RETURNING id, name, email, bio, categories, role, username`,
+      [name || null, bio || null, categories || null, userId, usernameWasProvided, normalizedUsername]
     );
 
     if (userUpdate.rowCount === 0) {
-      await pool.query("ROLLBACK");
+      await client.query("ROLLBACK");
+      transactionStarted = false;
       return res.status(404).json({ error: "User not found" });
     }
 
-    const updatedUser = userUpdate.rows[0];
-
     // 2. Update or create creators_page (profile image + creator bio)
     if (profile_image || bio !== undefined) {
-      await pool.query(
+      await client.query(
         `INSERT INTO creators_page (user_id, profile_image, bio, socials, updated_at)
          VALUES ($1, $2, $3, $4, NOW())
          ON CONFLICT (user_id) 
@@ -1865,12 +2370,15 @@ app.put("/profile", authenticateToken, async (req, res) => {
       );
     }
 
-    await pool.query("COMMIT");
+    await client.query("COMMIT");
+    transactionStarted = false;
+    client.release();
+    client = null;
 
     // Return fresh user data
     const verifyResult = await pool.query(
       `SELECT 
-          u.name, u.email, u.bio, u.categories, u.role,
+          u.name, u.email, u.bio, u.categories, u.role, u.username,
           u.badge_level, u.badge_downgrade_start,
           cp.profile_image,
           cp.bio AS creator_bio,
@@ -1891,6 +2399,7 @@ app.put("/profile", authenticateToken, async (req, res) => {
         id: userId,
         name: row.name,
         email: row.email,
+        username: row.username || null,
         bio: row.creator_bio || row.bio || "",
         categories: row.categories || [],
         profile_image: finalProfileImage,
@@ -1903,9 +2412,11 @@ app.put("/profile", authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
-    await pool.query("ROLLBACK");
+    if (transactionStarted && client) await client.query("ROLLBACK").catch(() => {});
     console.error("Profile update error:", error);
-    if (error.code === "23505") {
+    if (error.code === "23505" && String(error.constraint || "").includes("username")) {
+      res.status(409).json({ error: "That username is already taken" });
+    } else if (error.code === "23505") {
       res.status(400).json({ error: "Email already in use (if changing email, use dedicated flow)" });
     } else {
       res.status(500).json({ 
@@ -1913,6 +2424,8 @@ app.put("/profile", authenticateToken, async (req, res) => {
         details: process.env.NODE_ENV === 'development' ? error.message : undefined 
       });
     }
+  } finally {
+    if (client) client.release();
   }
 });
 
@@ -2308,8 +2821,8 @@ app.get("/explore", async (req, res) => {
                 p.id, p.user_id AS creator_id, p.type, p.title, p.caption, array_to_json(p.tags) AS tags, 
                 p.images, p.video_url, p.audio_url, p.created_at, p.is_premium, p.visibility, 
                 p.read_time, p.duration, p.status, p.is_copost, p.cohost_host_id,
-                u.name AS creator_name, cp.profile_image AS creator_avatar, u.badge_level AS creator_badge_level,
-                hu.name AS host_name, hcp.profile_image AS host_avatar,
+                u.name AS creator_name, u.username AS creator_username, cp.profile_image AS creator_avatar, u.badge_level AS creator_badge_level,
+                hu.name AS host_name, hu.username AS host_username, hcp.profile_image AS host_avatar,
                 COUNT(DISTINCT l.id) AS likes, COUNT(DISTINCT c.id) AS comments,
                 p.views, p.boost_multiplier, array_to_json(u.badges) AS creator_badges
             FROM posts p
@@ -2336,7 +2849,7 @@ app.get("/explore", async (req, res) => {
         }
 
         query += `
-            GROUP BY p.id, p.user_id, u.name, cp.profile_image, hu.name, hcp.profile_image, p.views, p.boost_multiplier, u.badges, u.badge_level
+            GROUP BY p.id, p.user_id, u.name, u.username, cp.profile_image, hu.name, hu.username, hcp.profile_image, p.views, p.boost_multiplier, u.badges, u.badge_level
         `;
 
         switch (sort) {
@@ -2373,6 +2886,7 @@ app.get("/explore", async (req, res) => {
             isPremium: post.is_premium,
             visibility: post.visibility,
             creatorName: post.creator_name,
+            creatorUsername: post.creator_username || null,
             creatorAvatar: post.creator_avatar || "https://placehold.co/40x40",
             creatorBadgeLevel: post.creator_badge_level || 0,
             likes: parseInt(post.likes) || 0,
@@ -2386,6 +2900,7 @@ app.get("/explore", async (req, res) => {
             isCopost: post.is_copost || false,
             cohostHostId: post.cohost_host_id || null,
             hostName: post.host_name || null,
+            hostUsername: post.host_username || null,
             hostAvatar: post.host_avatar || null
         }));
 
@@ -2702,16 +3217,21 @@ app.post("/posts/:id/comments", authenticateToken, async (req, res) => {
 app.get("/creator/:creatorName", async (req, res) => {
     const { creatorName } = req.params;
     const userId = req.user?.id;
+    const creatorIdentifier = creatorName.toLowerCase();
 
     try {
         const creatorResult = await pool.query(
             `SELECT 
-               u.id, u.name, u.bio, u.categories, u.badge_level, u.is_active_creator,
+               u.id, u.name, u.username, u.bio, u.categories, u.badge_level, u.is_active_creator,
                cp.profile_image, cp.socials
              FROM users u
              LEFT JOIN creators_page cp ON u.id = cp.user_id
-             WHERE LOWER(u.name) = $1 OR LOWER(REPLACE(u.name, ' ', '-')) = $1`,
-            [creatorName.toLowerCase()]
+             WHERE LOWER(u.username) = $1
+                OR LOWER(u.name) = $1
+                OR LOWER(REPLACE(u.name, ' ', '-')) = $1
+             ORDER BY CASE WHEN LOWER(u.username) = $1 THEN 0 ELSE 1 END
+             LIMIT 1`,
+            [creatorIdentifier]
         );
 
         if (creatorResult.rowCount === 0) {
@@ -2727,11 +3247,11 @@ app.get("/creator/:creatorName", async (req, res) => {
 
         const postsResult = await pool.query(
             `SELECT 
-               p.id, p.type, p.title, p.caption, array_to_json(p.tags) AS tags,
-               p.images, p.video_url, p.audio_url, p.created_at, p.is_premium,
+               p.id, p.user_id AS author_id, p.type, p.title, p.caption, array_to_json(p.tags) AS tags,
+               p.images, p.video_url, p.audio_url, p.created_at, p.expires_at, p.is_premium,
                p.visibility, p.read_time, p.duration, p.status, p.is_copost, p.cohost_host_id,
-               u.name AS author_name, cp.profile_image AS author_avatar,
-               hu.name AS host_name, hcp.profile_image AS host_avatar,
+               u.name AS author_name, u.username AS author_username, cp.profile_image AS author_avatar,
+               hu.name AS host_name, hu.username AS host_username, hcp.profile_image AS host_avatar,
                COUNT(DISTINCT l.id) AS likes, 
                COUNT(DISTINCT c.id) AS comments, p.views
              FROM posts p
@@ -2746,7 +3266,7 @@ app.get("/creator/:creatorName", async (req, res) => {
                AND p.is_draft = FALSE 
                AND p.expires_at > NOW() 
                AND p.status IN ('pending', 'approved')
-             GROUP BY p.id, p.views, u.name, cp.profile_image, hu.name, hcp.profile_image
+             GROUP BY p.id, p.views, u.name, u.username, cp.profile_image, hu.name, hu.username, hcp.profile_image
              ORDER BY p.created_at DESC
              LIMIT 20`,
             [creator.id]
@@ -2792,6 +3312,7 @@ app.get("/creator/:creatorName", async (req, res) => {
             creator: {
                 id: creator.id,
                 name: creator.name,
+                username: creator.username || null,
                 bio: creator.bio || "",
                 categories: creator.categories || [],
                 badge_level: badgeData.effectiveLevel,
@@ -2803,6 +3324,7 @@ app.get("/creator/:creatorName", async (req, res) => {
             },
             posts: postsResult.rows.map(post => ({
                 id: post.id,
+                authorId: post.author_id,
                 type: post.type,
                 title: post.title,
                 caption: post.caption,
@@ -2811,6 +3333,7 @@ app.get("/creator/:creatorName", async (req, res) => {
                 video_url: post.video_url,
                 audio_url: post.audio_url,
                 created_at: post.created_at,
+                expires_at: post.expires_at,
                 isPremium: post.is_premium,
                 read_time: post.read_time,
                 duration: post.duration,
@@ -2820,8 +3343,10 @@ app.get("/creator/:creatorName", async (req, res) => {
                 isCopost: post.is_copost || false,
                 cohostHostId: post.cohost_host_id || null,
                 authorName: post.author_name || null,
+                authorUsername: post.author_username || null,
                 authorAvatar: post.author_avatar || null,
                 hostName: post.host_name || null,
+                hostUsername: post.host_username || null,
                 hostAvatar: post.host_avatar || null
             })),
             stats,
@@ -3734,7 +4259,7 @@ app.post("/creators/:creatorId/payouts/request", authenticateToken, async (req, 
 
             console.log('🔐 Fetching M-Pesa access token...');
             const token = await getAccessToken();
-            console.log('✅ Access token acquired:', token);
+            console.log('✅ Access token acquired');
 
             console.log('🔑 Generating security credential...');
             const securityCredential = env.SECURITY_CREDENTIAL; // Assume this is pre-generated and stored securely
@@ -3801,6 +4326,8 @@ app.post("/creators/:creatorId/payouts/request", authenticateToken, async (req, 
 
 // B2C Callback Endpoint
 app.post("/api/mpesa/b2c_callback", async (req, res) => {
+    let client;
+    let transactionStarted = false;
     try {
         console.log('📥 Received B2C callback:', JSON.stringify(req.body, null, 2));
         const result = req.body.Body?.Result || req.body.Result;
@@ -3813,29 +4340,48 @@ app.post("/api/mpesa/b2c_callback", async (req, res) => {
         const status = (ResultCode === 0 || ResultCode === '0') ? 'completed' : 'failed';
 
         // Find the transaction by OriginatorConversationID
-        const transResult = await pool.query(
-            "SELECT id, creator_id, amount FROM transactions WHERE transaction_id = $1 AND type = 'payout' AND status = 'pending'",
+        client = await pool.connect();
+        await client.query("BEGIN");
+        transactionStarted = true;
+        const transResult = await client.query(
+            "SELECT id, creator_id, amount, type, description FROM transactions WHERE transaction_id = $1 AND type IN ('payout', 'cohost_refund') AND status = 'pending' FOR UPDATE",
             [OriginatorConversationID]
         );
         if (transResult.rowCount === 0) {
-            console.error("No matching pending payout transaction for OriginatorConversationID:", OriginatorConversationID);
-            return res.status(404).json({ error: "Transaction not found" });
+            console.warn("Ignoring duplicate or unknown B2C callback for OriginatorConversationID:", OriginatorConversationID);
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+            return res.sendStatus(200);
         }
 
         const transactionId = transResult.rows[0].id;
 
         // Update transaction status and M-Pesa TransactionID
-        await pool.query(
-            "UPDATE transactions SET status = $1, transaction_id = $2, description = $3 WHERE id = $4",
-            [status, TransactionID || OriginatorConversationID, `Payout ${status}: ${ResultDesc}`, transactionId]
+        await client.query(
+            "UPDATE transactions SET status = $1, transaction_id = $2, description = $3 WHERE id = $4 AND status = 'pending'",
+            [status, TransactionID || OriginatorConversationID, `${transResult.rows[0].type === 'cohost_refund' ? 'Co-host refund' : 'Payout'} ${status}: ${ResultDesc}`, transactionId]
         );
 
+        if (transResult.rows[0].type === "cohost_refund") {
+            const requestId = transResult.rows[0].description.match(/CoHost refund request #(\d+)/i)?.[1];
+            if (requestId) {
+                await client.query(
+                    "UPDATE cohost_requests SET payment_status = $1 WHERE id = $2 AND payment_status = 'refunding'",
+                    [status === "completed" ? "refunded" : "held", requestId]
+                );
+            }
+        }
+        await client.query("COMMIT");
+        transactionStarted = false;
         console.log(`✅ B2C payout ${status} for transaction ID ${transactionId}: ${ResultDesc}`);
 
         res.sendStatus(200);
     } catch (error) {
+        if (transactionStarted && client) await client.query("ROLLBACK").catch(() => {});
         console.error("B2C callback processing error:", error.message, error.stack);
         res.status(500).json({ error: "Failed to process callback" });
+    } finally {
+        if (client) client.release();
     }
 });
 
@@ -4900,7 +5446,75 @@ app.get("/api/boost/packages", (req, res) => {
     res.json({ packages: BOOST_PACKAGES });
 });
 
-// Boost a post
+// Extend an active post using one purchased credit
+app.post("/api/posts/:postId/extend", authenticateToken, requireAccountType("creator"), async (req, res) => {
+    const postId = Number.parseInt(req.params.postId, 10);
+    if (!Number.isInteger(postId) || postId <= 0) {
+        return res.status(400).json({ error: "Invalid post ID" });
+    }
+
+    let client;
+    let transactionStarted = false;
+    try {
+        client = await pool.connect();
+        await client.query("BEGIN");
+        transactionStarted = true;
+        const postResult = await client.query(
+            `SELECT id, user_id, cohost_host_id, expires_at
+             FROM posts
+             WHERE id = $1
+               AND ((is_copost = TRUE AND cohost_host_id = $2)
+                    OR (is_copost = FALSE AND user_id = $2))
+               AND is_draft = FALSE AND expires_at > NOW()
+             FOR UPDATE`,
+            [postId, req.user.id]
+        );
+        if (postResult.rowCount === 0) {
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+            return res.status(404).json({ error: "Active post not found for this creator" });
+        }
+
+        const debit = await client.query(
+            `UPDATE users SET credits = credits - 1
+             WHERE id = $1 AND credits >= 1
+             RETURNING credits`,
+            [req.user.id]
+        );
+        if (debit.rowCount === 0) {
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+            return res.status(400).json({ error: "One purchased credit is required to extend a post" });
+        }
+
+        const updated = await client.query(
+            `UPDATE posts SET expires_at = GREATEST(expires_at, NOW()) + INTERVAL '1 day',
+                              extended_days = extended_days + 1
+             WHERE id = $1
+             RETURNING expires_at, extended_days`,
+            [postId]
+        );
+        await client.query(
+            `INSERT INTO credit_transactions (user_id, amount, type, description)
+             VALUES ($1, -1, 'post_extension', $2)`,
+            [req.user.id, `Extended post #${postId} by one day`]
+        );
+        await client.query("COMMIT");
+        transactionStarted = false;
+        res.json({
+            message: "Post extended by one day",
+            expiresAt: updated.rows[0].expires_at,
+            extendedDays: updated.rows[0].extended_days
+        });
+    } catch (error) {
+        if (transactionStarted && client) await client.query("ROLLBACK").catch(() => {});
+        console.error("Post extension error:", error);
+        res.status(500).json({ error: "Failed to extend post" });
+    } finally {
+        if (client) client.release();
+    }
+});
+
 app.post("/api/posts/:postId/boost", authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
@@ -5386,6 +6000,2344 @@ app.patch("/api/admin/promotions/:id", authenticateToken, async (req, res) => {
     }
 });
 
+// ========== Admin Accounts ==========
+
+function parseAccountId(value) {
+    const text = String(value);
+    if (!/^\d+$/.test(text)) return null;
+    const id = Number.parseInt(text, 10);
+    return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+function parseBoundedInt(value, fallback, min, max) {
+    if (value === undefined || value === null || value === "") return fallback;
+    const text = String(value);
+    if (!/^\d+$/.test(text)) return null;
+    const parsed = Number.parseInt(text, 10);
+    return parsed >= min && parsed <= max ? parsed : null;
+}
+
+function isValidDateOnly(value) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const parsed = new Date(`${value}T00:00:00.000Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function escapeLikeValue(value) {
+    return value.replace(/[\\%_]/g, "\\$&");
+}
+
+function getRequestId(req) {
+    const requested = String(req.get("x-request-id") || "").trim().slice(0, 100);
+    return requested || crypto.randomUUID();
+}
+
+function mapAccountSummary(row) {
+    return {
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        role: row.role || "user",
+        accountType: row.account_type || "creator",
+        isCreator: !!row.is_creator,
+        isActiveCreator: !!row.is_active_creator,
+        accountStatus: row.account_status || "active",
+        accountStatusReason: row.account_status_reason || null,
+        accountStatusUpdatedAt: row.account_status_updated_at || null,
+        createdAt: row.created_at || null,
+        lastActivityAt: row.last_activity_at || row.created_at || null,
+        credits: row.credits === null || row.credits === undefined ? 0 : row.credits,
+        badgeLevel: row.badge_level === null || row.badge_level === undefined ? 0 : row.badge_level,
+        activeUntil: row.active_until || null,
+        profileImage: row.profile_image || null,
+        companyName: row.company_name || null
+    };
+}
+
+app.get("/api/admin/me", authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT id, name, email, role FROM users WHERE id = $1",
+            [req.user.id]
+        );
+        if (result.rowCount === 0) {
+            return res.status(401).json({ error: "Account not found" });
+        }
+
+        const user = result.rows[0];
+        const permissions = permissionsForRole(user.role);
+        if (permissions.length === 0) {
+            return res.status(403).json({ error: "Staff access required", code: "PERMISSION_DENIED" });
+        }
+
+        res.json({
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                role: user.role
+            },
+            permissions
+        });
+    } catch (error) {
+        console.error("Admin session error:", error);
+        res.status(500).json({ error: "Failed to load admin session" });
+    }
+});
+
+app.get("/api/admin/accounts", authenticateToken, requirePermission("accounts.read"), async (req, res) => {
+    try {
+        const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 120) : "";
+        const status = typeof req.query.status === "string" ? req.query.status : "all";
+        const type = typeof req.query.type === "string" ? req.query.type : "all";
+        const role = typeof req.query.role === "string" ? req.query.role : "all";
+        const sort = typeof req.query.sort === "string" ? req.query.sort : "created_at";
+        const order = typeof req.query.order === "string" ? req.query.order.toLowerCase() : "desc";
+        const createdFrom = typeof req.query.created_from === "string" ? req.query.created_from : "";
+        const createdTo = typeof req.query.created_to === "string" ? req.query.created_to : "";
+        const limit = parseBoundedInt(req.query.limit, 25, 1, 100);
+        const offset = parseBoundedInt(req.query.offset, 0, 0, 1000000);
+
+        if (!["all", "active", "suspended", "closed"].includes(status)) {
+            return res.status(400).json({ error: "Invalid status filter" });
+        }
+        if (!["all", "creator", "business", "member"].includes(type)) {
+            return res.status(400).json({ error: "Invalid account type filter" });
+        }
+        if (!["all", "user", "moderator", "admin"].includes(role)) {
+            return res.status(400).json({ error: "Invalid role filter" });
+        }
+        if (!["created_at", "name", "last_active", "status"].includes(sort)) {
+            return res.status(400).json({ error: "Invalid sort field" });
+        }
+        if (!["asc", "desc"].includes(order)) {
+            return res.status(400).json({ error: "Invalid sort order" });
+        }
+        if (createdFrom && !isValidDateOnly(createdFrom)) {
+            return res.status(400).json({ error: "Invalid created_from date" });
+        }
+        if (createdTo && !isValidDateOnly(createdTo)) {
+            return res.status(400).json({ error: "Invalid created_to date" });
+        }
+        if (createdFrom && createdTo && createdFrom > createdTo) {
+            return res.status(400).json({ error: "created_from must be before created_to" });
+        }
+        if (limit === null) {
+            return res.status(400).json({ error: "Limit must be between 1 and 100" });
+        }
+        if (offset === null) {
+            return res.status(400).json({ error: "Offset is invalid" });
+        }
+
+        const where = [];
+        const params = [];
+
+        if (q) {
+            const escaped = escapeLikeValue(q);
+            const idParam = params.length + 1;
+            const likeParam = params.length + 2;
+            params.push(q, `%${escaped}%`, `%${escaped}%`);
+            where.push(`(u.id::text = $${idParam} OR u.name ILIKE $${likeParam} OR u.email ILIKE $${likeParam + 1})`);
+        }
+        if (status !== "all") {
+            params.push(status);
+            where.push(`u.account_status = $${params.length}`);
+        }
+        if (type === "creator") {
+            where.push("u.is_creator = TRUE");
+        } else if (type === "business") {
+            where.push("COALESCE(u.account_type, 'creator') = 'business'");
+        } else if (type === "member") {
+            where.push("u.is_creator = FALSE AND COALESCE(u.account_type, 'creator') <> 'business'");
+        }
+        if (role !== "all") {
+            params.push(role);
+            where.push(`u.role = $${params.length}`);
+        }
+        if (createdFrom) {
+            params.push(createdFrom);
+            where.push(`u.created_at >= $${params.length}::date`);
+        }
+        if (createdTo) {
+            params.push(createdTo);
+            where.push(`u.created_at < ($${params.length}::date + INTERVAL '1 day')`);
+        }
+
+        const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+        const sortExpressions = {
+            created_at: "u.created_at",
+            name: "LOWER(u.name)",
+            last_active: "last_activity_at",
+            status: "u.account_status"
+        };
+        const direction = order === "asc" ? "ASC" : "DESC";
+        const orderSql = `ORDER BY ${sortExpressions[sort]} ${direction} NULLS LAST, u.id ${direction}`;
+
+        const countResult = await pool.query(
+            `SELECT COUNT(*)::int AS total FROM users u ${whereSql}`,
+            params
+        );
+        const total = countResult.rows[0].total;
+
+        const dataParams = [...params, limit, offset];
+        const dataResult = await pool.query(
+            `SELECT
+                u.id, u.name, u.email, u.role, u.is_creator, u.is_active_creator,
+                u.account_type, u.account_status, u.account_status_reason,
+                u.account_status_updated_at, u.created_at, u.credits, u.badge_level,
+                u.active_until,
+                cp.profile_image,
+                bp.company_name,
+                GREATEST(
+                    u.created_at,
+                    (SELECT MAX(p.created_at) FROM posts p WHERE p.user_id = u.id),
+                    (SELECT MAX(t.created_at) FROM transactions t WHERE t.creator_id = u.id),
+                    (SELECT MAX(m.created_at) FROM messages m WHERE m.sender_id = u.id)
+                ) AS last_activity_at
+             FROM users u
+             LEFT JOIN creators_page cp ON cp.user_id = u.id
+             LEFT JOIN business_profiles bp ON bp.user_id = u.id
+             ${whereSql}
+             ${orderSql}
+             LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+            dataParams
+        );
+
+        res.json({
+            items: dataResult.rows.map(mapAccountSummary),
+            pagination: {
+                limit,
+                offset,
+                total,
+                page: Math.floor(offset / limit) + 1,
+                pages: total === 0 ? 0 : Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        console.error("Admin accounts list error:", error);
+        res.status(500).json({ error: "Failed to load accounts" });
+    }
+});
+
+app.get("/api/admin/accounts/:id", authenticateToken, requirePermission("accounts.read"), async (req, res) => {
+    const accountId = parseAccountId(req.params.id);
+    if (!accountId) {
+        return res.status(400).json({ error: "Invalid account ID" });
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT
+                u.id, u.name, u.email, u.role, u.is_creator, u.is_active_creator,
+                u.account_type, u.account_status, u.account_status_reason,
+                u.account_status_updated_at, u.account_status_updated_by,
+                u.created_at, u.credits, u.badge_level, u.active_until, u.last_sale_at,
+                u.referral_code, u.bio, u.categories,
+                cp.profile_image, cp.bio AS creator_bio, cp.socials,
+                bp.company_name, bp.industry, bp.logo_url,
+                ab.name AS status_updated_by_name,
+                GREATEST(
+                    u.created_at,
+                    (SELECT MAX(p.created_at) FROM posts p WHERE p.user_id = u.id),
+                    (SELECT MAX(t.created_at) FROM transactions t WHERE t.creator_id = u.id),
+                    (SELECT MAX(m.created_at) FROM messages m WHERE m.sender_id = u.id)
+                ) AS last_activity_at,
+                (SELECT COUNT(*)::int FROM posts p WHERE p.user_id = u.id) AS post_count,
+                (SELECT COUNT(*)::int FROM transactions t WHERE t.creator_id = u.id) AS transaction_count,
+                (SELECT COUNT(*)::int FROM reports r
+                    JOIN posts p ON p.id = r.post_id
+                    WHERE p.user_id = u.id AND r.status = 'pending') AS open_report_count,
+                (SELECT COUNT(*)::int FROM subscriptions s
+                    WHERE s.creator_id = u.id AND s.end_date > CURRENT_DATE
+                    AND s.payment_status = 'completed') AS active_subscriber_count
+             FROM users u
+             LEFT JOIN creators_page cp ON cp.user_id = u.id
+             LEFT JOIN business_profiles bp ON bp.user_id = u.id
+             LEFT JOIN users ab ON ab.id = u.account_status_updated_by
+             WHERE u.id = $1`,
+            [accountId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: "Account not found" });
+        }
+
+        const row = result.rows[0];
+        const account = mapAccountSummary(row);
+        account.bio = row.creator_bio || row.bio || null;
+        account.categories = row.categories || [];
+        account.referralCode = row.referral_code || null;
+        account.lastSaleAt = row.last_sale_at || null;
+        account.socials = row.socials || {};
+        account.industry = row.industry || null;
+        account.logoUrl = row.logo_url || null;
+
+        res.json({
+            account,
+            access: {
+                status: account.accountStatus,
+                reason: account.accountStatusReason,
+                updatedAt: account.accountStatusUpdatedAt,
+                updatedBy: row.status_updated_by_name
+                    ? { id: row.account_status_updated_by, name: row.status_updated_by_name }
+                    : null
+            },
+            creator: {
+                isCreator: account.isCreator,
+                isActiveCreator: account.isActiveCreator,
+                badgeLevel: account.badgeLevel,
+                activeUntil: account.activeUntil,
+                lastSaleAt: account.lastSaleAt,
+                referralCode: account.referralCode,
+                subscriberCount: row.active_subscriber_count || 0
+            },
+            activity: {
+                lastActivityAt: account.lastActivityAt,
+                postCount: row.post_count || 0,
+                transactionCount: row.transaction_count || 0,
+                openReportCount: row.open_report_count || 0
+            }
+        });
+    } catch (error) {
+        console.error("Admin account detail error:", error);
+        res.status(500).json({ error: "Failed to load account" });
+    }
+});
+
+app.get("/api/admin/accounts/:id/activity", authenticateToken, requirePermission("accounts.read"), async (req, res) => {
+    const accountId = parseAccountId(req.params.id);
+    if (!accountId) {
+        return res.status(400).json({ error: "Invalid account ID" });
+    }
+
+    const type = typeof req.query.type === "string" ? req.query.type : "all";
+    const limit = parseBoundedInt(req.query.limit, 10, 1, 50);
+    const offset = parseBoundedInt(req.query.offset, 0, 0, 1000000);
+
+    if (!["all", "posts", "transactions"].includes(type)) {
+        return res.status(400).json({ error: "Invalid activity type" });
+    }
+    if (limit === null) {
+        return res.status(400).json({ error: "Limit must be between 1 and 50" });
+    }
+    if (offset === null) {
+        return res.status(400).json({ error: "Offset is invalid" });
+    }
+
+    try {
+        const exists = await pool.query("SELECT 1 FROM users WHERE id = $1", [accountId]);
+        if (exists.rowCount === 0) {
+            return res.status(404).json({ error: "Account not found" });
+        }
+
+        const counts = await pool.query(
+            `SELECT
+                (SELECT COUNT(*)::int FROM posts WHERE user_id = $1) AS post_count,
+                (SELECT COUNT(*)::int FROM transactions WHERE creator_id = $1) AS transaction_count`,
+            [accountId]
+        );
+        const postCount = counts.rows[0].post_count;
+        const transactionCount = counts.rows[0].transaction_count;
+        const total = type === "posts" ? postCount : type === "transactions" ? transactionCount : postCount + transactionCount;
+
+        const branches = [];
+        if (type !== "transactions") {
+            branches.push(`
+                SELECT 'post' AS kind, p.id, p.type AS subtype,
+                       COALESCE(NULLIF(p.title, ''), LEFT(p.caption, 140)) AS summary,
+                       p.status, p.created_at
+                FROM posts p
+                WHERE p.user_id = $1
+            `);
+        }
+        if (type !== "posts") {
+            branches.push(`
+                SELECT 'transaction' AS kind, t.id, t.type AS subtype,
+                       COALESCE(NULLIF(t.description, ''), t.type) AS summary,
+                       t.status, t.created_at
+                FROM transactions t
+                WHERE t.creator_id = $1
+            `);
+        }
+
+        const result = await pool.query(
+            `SELECT * FROM (${branches.join(" UNION ALL ")}) AS activity
+             ORDER BY created_at DESC, id DESC
+             LIMIT $2 OFFSET $3`,
+            [accountId, limit, offset]
+        );
+
+        res.json({
+            items: result.rows.map((row) => ({
+                kind: row.kind,
+                id: row.id,
+                subtype: row.subtype || null,
+                summary: row.summary || null,
+                status: row.status || null,
+                createdAt: row.created_at
+            })),
+            pagination: {
+                limit,
+                offset,
+                total,
+                page: Math.floor(offset / limit) + 1,
+                pages: total === 0 ? 0 : Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        console.error("Admin account activity error:", error);
+        res.status(500).json({ error: "Failed to load account activity" });
+    }
+});
+
+app.get("/api/admin/accounts/:id/audit", authenticateToken, requirePermission("accounts.read"), async (req, res) => {
+    const accountId = parseAccountId(req.params.id);
+    if (!accountId) {
+        return res.status(400).json({ error: "Invalid account ID" });
+    }
+
+    const limit = parseBoundedInt(req.query.limit, 20, 1, 100);
+    const offset = parseBoundedInt(req.query.offset, 0, 0, 1000000);
+
+    if (limit === null) {
+        return res.status(400).json({ error: "Limit must be between 1 and 100" });
+    }
+    if (offset === null) {
+        return res.status(400).json({ error: "Offset is invalid" });
+    }
+
+    try {
+        const exists = await pool.query("SELECT 1 FROM users WHERE id = $1", [accountId]);
+        if (exists.rowCount === 0) {
+            return res.status(404).json({ error: "Account not found" });
+        }
+
+        const countResult = await pool.query(
+            `SELECT COUNT(*)::int AS total
+             FROM admin_audit_log
+             WHERE target_type = 'account' AND target_id = $1`,
+            [accountId]
+        );
+        const total = countResult.rows[0].total;
+
+        const result = await pool.query(
+            `SELECT
+                a.id, a.action, a.target_type, a.target_id, a.reason,
+                a.before_state, a.after_state, a.request_id, a.created_at,
+                a.actor_id, u.name AS actor_name, u.email AS actor_email
+             FROM admin_audit_log a
+             LEFT JOIN users u ON u.id = a.actor_id
+             WHERE a.target_type = 'account' AND a.target_id = $1
+             ORDER BY a.created_at DESC, a.id DESC
+             LIMIT $2 OFFSET $3`,
+            [accountId, limit, offset]
+        );
+
+        res.json({
+            items: result.rows.map((row) => ({
+                id: row.id,
+                action: row.action,
+                targetType: row.target_type,
+                targetId: row.target_id,
+                reason: row.reason,
+                beforeState: row.before_state,
+                afterState: row.after_state,
+                requestId: row.request_id,
+                createdAt: row.created_at,
+                actor: row.actor_name
+                    ? { id: row.actor_id, name: row.actor_name, email: row.actor_email }
+                    : null
+            })),
+            pagination: {
+                limit,
+                offset,
+                total,
+                page: Math.floor(offset / limit) + 1,
+                pages: total === 0 ? 0 : Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        console.error("Admin account audit error:", error);
+        res.status(500).json({ error: "Failed to load account audit history" });
+    }
+});
+
+async function changeAccountAccessStatus(req, res, options) {
+    const accountId = parseAccountId(req.params.id);
+    if (!accountId) {
+        return res.status(400).json({ error: "Invalid account ID" });
+    }
+
+    const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+    if (reason.length < 3) {
+        return res.status(400).json({ error: "A reason of at least 3 characters is required" });
+    }
+    if (reason.length > 500) {
+        return res.status(400).json({ error: "Reason must be 500 characters or fewer" });
+    }
+    if (accountId === req.staff.id) {
+        return res.status(400).json({ error: "You cannot change your own access status" });
+    }
+
+    let client;
+    try {
+        client = await pool.connect();
+        await client.query("BEGIN");
+
+        const currentResult = await client.query(
+            `SELECT id, name, email, role, account_status, account_status_reason
+             FROM users
+             WHERE id = $1
+             FOR UPDATE`,
+            [accountId]
+        );
+        if (currentResult.rowCount === 0) {
+            await client.query("ROLLBACK");
+            return res.status(404).json({ error: "Account not found" });
+        }
+
+        const current = currentResult.rows[0];
+        const currentStatus = current.account_status || "active";
+
+        if (currentStatus === options.nextStatus) {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+                error: `Account is already ${options.nextStatus}`,
+                accountStatus: currentStatus
+            });
+        }
+        if (!options.allowedFrom.includes(currentStatus)) {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+                error: `Cannot ${options.actionLabel} an account with status ${currentStatus}`,
+                accountStatus: currentStatus
+            });
+        }
+
+        const beforeState = {
+            accountStatus: currentStatus,
+            reason: current.account_status_reason || null
+        };
+        const afterState = {
+            accountStatus: options.nextStatus,
+            reason
+        };
+
+        const updateResult = await client.query(
+            `UPDATE users
+             SET account_status = $1,
+                 account_status_reason = $2,
+                 account_status_updated_at = NOW(),
+                 account_status_updated_by = $3
+             WHERE id = $4
+             RETURNING id, name, email, role, account_type, is_creator, is_active_creator,
+                       account_status, account_status_reason, account_status_updated_at, created_at`,
+            [options.nextStatus, reason, req.staff.id, accountId]
+        );
+        const updated = updateResult.rows[0];
+
+        const requestId = getRequestId(req);
+        const auditResult = await client.query(
+            `INSERT INTO admin_audit_log
+                (actor_id, action, target_type, target_id, reason, before_state, after_state, request_id)
+             VALUES ($1, $2, 'account', $3, $4, $5::jsonb, $6::jsonb, $7)
+             RETURNING id, created_at`,
+            [
+                req.staff.id,
+                options.action,
+                accountId,
+                reason,
+                JSON.stringify(beforeState),
+                JSON.stringify(afterState),
+                requestId
+            ]
+        );
+
+        await client.query("COMMIT");
+        setCachedAccountStatus(accountId, options.nextStatus);
+
+        res.json({
+            message: options.message,
+            changed: true,
+            account: {
+                id: updated.id,
+                name: updated.name,
+                email: updated.email,
+                role: updated.role,
+                accountType: updated.account_type || "creator",
+                isCreator: !!updated.is_creator,
+                isActiveCreator: !!updated.is_active_creator,
+                accountStatus: updated.account_status,
+                accountStatusReason: updated.account_status_reason,
+                accountStatusUpdatedAt: updated.account_status_updated_at,
+                createdAt: updated.created_at
+            },
+            audit: {
+                id: auditResult.rows[0].id,
+                createdAt: auditResult.rows[0].created_at,
+                requestId
+            }
+        });
+    } catch (error) {
+        if (client) {
+            try {
+                await client.query("ROLLBACK");
+            } catch (rollbackError) {
+                console.error("Account status rollback error:", rollbackError.message);
+            }
+        }
+        console.error(`Admin account ${options.action} error:`, error);
+        res.status(500).json({ error: "Failed to update account status" });
+    } finally {
+        if (client) client.release();
+    }
+}
+
+app.post(
+    "/api/admin/accounts/:id/suspend",
+    authenticateToken,
+    requirePermission("accounts.status"),
+    (req, res) => changeAccountAccessStatus(req, res, {
+        nextStatus: "suspended",
+        allowedFrom: ["active"],
+        action: "account.suspend",
+        actionLabel: "suspend",
+        message: "Account suspended"
+    })
+);
+
+app.post(
+    "/api/admin/accounts/:id/reinstate",
+    authenticateToken,
+    requirePermission("accounts.status"),
+    (req, res) => changeAccountAccessStatus(req, res, {
+        nextStatus: "active",
+        allowedFrom: ["suspended"],
+        action: "account.reinstate",
+        actionLabel: "reinstate",
+        message: "Account reinstated"
+    })
+);
+
+// ========== Admin Finance (read-only Stage 1) ==========
+
+const FINANCE_CURRENCY = "KES";
+const FINANCE_TIMEZONE_NOTE = "Legacy timestamps are stored without a timezone. This console filters by stored calendar dates and displays stored wall-clock values.";
+const FINANCE_STATUS_VALUES = Object.freeze(["pending", "completed", "failed"]);
+const FINANCE_TYPE_META = Object.freeze({
+    subscription: { label: "Subscription payment", category: "Subscription", cashClass: "external receipt", direction: "credit" },
+    payout: { label: "Payout", category: "Payout", cashClass: "external payout", direction: "debit" },
+    referral_commission: { label: "Referral commission", category: "Creator earning", cashClass: "internal allocation", direction: "credit" },
+    referral_fee: { label: "Referral fee", category: "Subscription deduction", cashClass: "internal allocation", direction: "debit" },
+    platform_fee: { label: "Platform fee", category: "Platform fee", cashClass: "internal allocation", direction: "debit" },
+    credit_purchase: { label: "Credit purchase", category: "Credit purchase", cashClass: "external receipt", direction: "credit" },
+    reactivation_fee: { label: "Reactivation fee", category: "Reactivation", cashClass: "funding unverified", direction: "credit" },
+    badge_reward: { label: "Badge credit reward", category: "Non-cash credit", cashClass: "non-cash", direction: "credit" },
+    cohost_payment: { label: "Co-host payment", category: "Co-host", cashClass: "funding unverified", direction: "debit" },
+    cohost_refund: { label: "Co-host refund", category: "Refund", cashClass: "non-cash", direction: "credit" },
+    cohost_host_earning: { label: "Co-host host earning", category: "Creator earning", cashClass: "internal allocation", direction: "credit" },
+    cohost_referrer_earning: { label: "Co-host referrer earning", category: "Creator earning", cashClass: "internal allocation", direction: "credit" },
+    cohost_platform_fee: { label: "Co-host platform fee", category: "Platform fee", cashClass: "internal allocation", direction: "debit" },
+    escrow_deposit: { label: "Escrow deposit", category: "Escrow", cashClass: "escrow deposit", direction: "debit" },
+    escrow_release: { label: "Escrow release", category: "Escrow", cashClass: "internal allocation", direction: "credit" }
+});
+const FINANCE_TYPE_VALUES = Object.freeze(Object.keys(FINANCE_TYPE_META));
+const FINANCE_FLOWS = Object.freeze({
+    external_receipts: ["subscription", "credit_purchase", "reactivation_fee"],
+    payouts: ["payout"],
+    subscription: ["subscription", "referral_fee", "referral_commission", "platform_fee"],
+    creator_earnings: ["referral_commission", "cohost_host_earning", "cohost_referrer_earning", "escrow_release"],
+    creator_balance: ["subscription", "referral_commission", "referral_fee", "platform_fee", "reactivation_fee", "cohost_host_earning", "cohost_referrer_earning", "cohost_platform_fee", "escrow_release", "payout"],
+    platform_fees: ["platform_fee", "cohost_platform_fee"],
+    cohost: ["cohost_payment", "cohost_refund", "cohost_host_earning", "cohost_referrer_earning", "cohost_platform_fee"],
+    escrow: ["escrow_deposit", "escrow_release"],
+    credits_and_adjustments: ["credit_purchase", "reactivation_fee", "badge_reward", "cohost_refund"],
+    refunds: ["cohost_refund"],
+    funding_unverified: ["cohost_payment", "escrow_deposit"]
+});
+const FINANCE_TRANSACTION_ISSUES = Object.freeze({
+    stale_pending: "Pending for more than 24 hours",
+    duplicate_reference: "Reference appears more than once",
+    missing_reference: "Required reference is missing",
+    sign_anomaly: "Amount sign does not match the transaction type",
+    split_missing: "Completed subscription has no revenue split",
+    split_mismatch: "Revenue split does not match the subscription amount",
+    payout_reference_local: "Completed payout still has a local reference"
+});
+const FINANCE_TRANSACTION_ISSUE_VALUES = Object.freeze(Object.keys(FINANCE_TRANSACTION_ISSUES));
+const FINANCE_PAYOUT_ISSUES = Object.freeze(["stale_pending", "missing_reference", "sign_anomaly", "payout_reference_local"]);
+const FINANCE_ESCROW_ISSUES = Object.freeze({
+    missing_deposit: "Deposited campaign has no linked deposit transaction",
+    missing_release: "Released campaign has no linked release transaction",
+    missing_provider_ref: "M-Pesa campaign has no provider reference",
+    deposit_mismatch: "Deposit total does not match escrow amount"
+});
+const FINANCE_ESCROW_ISSUE_VALUES = Object.freeze(Object.keys(FINANCE_ESCROW_ISSUES));
+const FINANCE_KNOWN_LIMITATIONS = Object.freeze([
+    "The transactions table is a typed activity record, not a balanced ledger.",
+    "Transaction references are overwritten by M-Pesa receipts, so the original local reference is not retained after a callback.",
+    "No provider event, callback, or settlement import tables exist, so provider matching is unavailable in Stage 1.",
+    "Campaign escrow code writes pending_deposit and deposit_failed values that the deployed check constraints reject.",
+    "Historical payout methods are not stored on payout transactions; the current payout setting is shown instead.",
+    "Co-host and escrow transaction rows do not record whether wallet credits or M-Pesa funded the movement."
+]);
+const FINANCE_DEFINITIONS = Object.freeze({
+    externalReceipts: "Completed positive subscription, credit-purchase, and reactivation transaction rows in the selected period. Co-host and escrow deposits are excluded because their funding source is not recorded on the transaction row.",
+    platformFees: "Completed negative platform_fee and cohost_platform_fee rows in the selected period, shown as positive. Campaign escrow platform share is not recorded as a platform-fee row and is excluded.",
+    creatorPayable: "Completed subscription, referral, co-host, and escrow-release earnings, plus referral/platform fee deductions and wallet-paid reactivation fees, plus completed payout rows. Pending payouts are shown separately. This is a legacy estimate, not a posted ledger balance.",
+    payoutsSettled: "Completed payout transaction rows. Completion comes from the application callback and is not independently matched to provider settlement.",
+    escrowHeld: "Current sum of campaigns.escrow_amount where escrow_status is deposited. This is a current position, not a historical date-filtered balance.",
+    creditsOutstanding: "Current sum of users.credits. It includes free and purchased credits and is not a cash balance."
+});
+
+function financeToday() {
+    return new Date().toISOString().slice(0, 10);
+}
+
+function financeDaysAgo(days) {
+    const date = new Date();
+    date.setUTCDate(date.getUTCDate() - days);
+    return date.toISOString().slice(0, 10);
+}
+
+function parseFinanceDateRange(query, defaultDays) {
+    const requestedFrom = typeof query.from === "string" ? query.from.trim() : "";
+    const requestedTo = typeof query.to === "string" ? query.to.trim() : "";
+    const to = requestedTo || financeToday();
+    if (!isValidDateOnly(to)) return { error: "Invalid to date" };
+    const from = requestedFrom || (() => {
+        const base = new Date(`${to}T00:00:00.000Z`);
+        base.setUTCDate(base.getUTCDate() - (defaultDays - 1));
+        return base.toISOString().slice(0, 10);
+    })();
+
+    if (!isValidDateOnly(from)) return { error: "Invalid from date" };
+    if (from > to) return { error: "from must be before or equal to to" };
+
+    const fromDate = new Date(`${from}T00:00:00.000Z`);
+    const toDate = new Date(`${to}T00:00:00.000Z`);
+    const days = Math.floor((toDate.getTime() - fromDate.getTime()) / 86400000) + 1;
+    if (days > 366) return { error: "Date range cannot exceed 366 days" };
+    return { from, to, days };
+}
+
+function parseFinanceId(value) {
+    const text = String(value);
+    if (!/^\d+$/.test(text)) return null;
+    const parsed = Number.parseInt(text, 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseFinanceAmount(value, fieldName) {
+    if (value === undefined || value === null || value === "") return { value: "" };
+    if (typeof value !== "string") return { error: `Invalid ${fieldName}` };
+    const text = value.trim();
+    if (!/^\d{1,9}(\.\d{1,2})?$/.test(text)) return { error: `Invalid ${fieldName}` };
+    return { value: text };
+}
+
+function financeTypeMeta(type) {
+    return FINANCE_TYPE_META[type] || {
+        label: String(type || "Unknown").replace(/_/g, " ").replace(/\b\w/g, (character) => character.toUpperCase()),
+        category: "Unclassified",
+        cashClass: "unclassified",
+        direction: "unknown"
+    };
+}
+
+function financeFlowCondition(flow, alias) {
+    if (!flow || flow === "all") return "";
+    if (flow === "external_receipts") {
+        return `(${alias}.type IN ('subscription', 'credit_purchase') OR (${alias}.type = 'reactivation_fee' AND ${alias}.amount > 0))`;
+    }
+    const types = FINANCE_FLOWS[flow];
+    if (!types) return "";
+    return `${alias}.type IN (${types.map((type) => `'${type}'`).join(", ")})`;
+}
+
+function financeIssueCondition(issue, alias) {
+    switch (issue) {
+        case "stale_pending":
+            return `${alias}.status = 'pending' AND ${alias}.created_at < NOW() - INTERVAL '24 hours'`;
+        case "duplicate_reference":
+            return `${alias}.transaction_id IS NOT NULL AND BTRIM(${alias}.transaction_id) <> '' AND EXISTS (
+                SELECT 1 FROM transactions finance_dupe
+                WHERE finance_dupe.transaction_id = ${alias}.transaction_id AND finance_dupe.id <> ${alias}.id
+            )`;
+        case "missing_reference":
+            return `(${alias}.transaction_id IS NULL OR BTRIM(${alias}.transaction_id) = '') AND ${alias}.type IN ('subscription', 'credit_purchase', 'payout', 'escrow_deposit', 'cohost_payment') AND ${alias}.status IN ('pending', 'completed')`;
+        case "sign_anomaly":
+            return `(
+                (${alias}.type = 'payout' AND ${alias}.amount >= 0)
+                OR (${alias}.type IN ('subscription', 'credit_purchase', 'referral_commission', 'cohost_host_earning', 'cohost_referrer_earning', 'escrow_release', 'cohost_refund', 'badge_reward') AND ${alias}.amount < 0)
+                OR (${alias}.type IN ('referral_fee', 'platform_fee', 'cohost_platform_fee', 'escrow_deposit', 'cohost_payment') AND ${alias}.amount > 0)
+            )`;
+        case "split_missing":
+            return `${alias}.type = 'subscription' AND ${alias}.status = 'completed' AND NOT EXISTS (
+                SELECT 1 FROM revenue_splits finance_split WHERE finance_split.transaction_id = ${alias}.transaction_id
+            )`;
+        case "split_mismatch":
+            return `${alias}.type = 'subscription' AND ${alias}.status = 'completed' AND EXISTS (
+                SELECT 1 FROM revenue_splits finance_split
+                WHERE finance_split.transaction_id = ${alias}.transaction_id
+                AND (finance_split.total_amount <> ${alias}.amount
+                    OR finance_split.creator_amount + COALESCE(finance_split.referrer_amount, 0) + COALESCE(finance_split.platform_amount, 0) <> finance_split.total_amount)
+            )`;
+        case "payout_reference_local":
+            return `${alias}.type = 'payout' AND ${alias}.status = 'completed' AND (${alias}.transaction_id IS NULL OR BTRIM(${alias}.transaction_id) = '' OR ${alias}.transaction_id LIKE 'PAYOUT-%')`;
+        default:
+            return "";
+    }
+}
+
+function financeEscrowIssueCondition(issue, alias) {
+    switch (issue) {
+        case "missing_deposit":
+            return `${alias}.escrow_status = 'deposited' AND NOT EXISTS (
+                SELECT 1 FROM transactions finance_deposit
+                WHERE finance_deposit.type = 'escrow_deposit'
+                AND finance_deposit.description LIKE 'Escrow deposit for campaign #' || ${alias}.id || ':%'
+            )`;
+        case "missing_release":
+            return `${alias}.escrow_status = 'released' AND NOT EXISTS (
+                SELECT 1 FROM transactions finance_release
+                WHERE finance_release.type = 'escrow_release'
+                AND finance_release.description LIKE 'Campaign sponsorship payout for #' || ${alias}.id || '%'
+            )`;
+        case "missing_provider_ref":
+            return `${alias}.payment_method = 'mpesa' AND ${alias}.escrow_status IN ('deposited', 'released') AND (${alias}.mpesa_transaction_id IS NULL OR BTRIM(${alias}.mpesa_transaction_id) = '')`;
+        case "deposit_mismatch":
+            return `${alias}.escrow_status = 'deposited' AND COALESCE((
+                SELECT SUM(ABS(finance_deposit.amount)) FROM transactions finance_deposit
+                WHERE finance_deposit.type = 'escrow_deposit'
+                AND finance_deposit.description LIKE 'Escrow deposit for campaign #' || ${alias}.id || ':%'
+            ), 0) <> ${alias}.escrow_amount`;
+        default:
+            return "";
+    }
+}
+
+function inferFinanceLink(type, reference, description) {
+    const ref = String(reference || "");
+    const desc = String(description || "");
+    let match;
+
+    if (type === "payout") return { kind: "payout", id: null, confidence: "self" };
+    if (type === "escrow_deposit") {
+        match = desc.match(/campaign #(\d+)/i);
+        if (match) return { kind: "campaign", id: Number(match[1]), confidence: "derived" };
+    }
+    if (type === "escrow_release") {
+        match = desc.match(/#(\d+)/);
+        if (match) return { kind: "campaign", id: Number(match[1]), confidence: "derived" };
+    }
+    if (type === "subscription" || type === "referral_fee" || type === "platform_fee") {
+        match = desc.match(/subscription(?: payment for ID| #)\s*#?(\d+)/i);
+        if (match) return { kind: "subscription", id: Number(match[1]), confidence: "derived" };
+    }
+    if (type === "cohost_payment" || type === "cohost_refund" || type === "cohost_host_earning" || type === "cohost_referrer_earning" || type === "cohost_platform_fee") {
+        match = desc.match(/request #(\d+)/i);
+        if (match) return { kind: "cohost_request", id: Number(match[1]), confidence: "derived" };
+        match = ref.match(/^CH(?:PAY|MPESA|REF)-(\d+)/i);
+        if (match) return { kind: "cohost_request", id: Number(match[1]), confidence: "derived" };
+    }
+    if (type === "referral_commission") {
+        match = desc.match(/from creator #(\d+)/i);
+        if (match) return { kind: "account", id: Number(match[1]), confidence: "derived" };
+    }
+    return { kind: null, id: null, confidence: "none" };
+}
+
+function financeSignAnomaly(type, amount) {
+    const value = Number(amount);
+    if (type === "payout") return value >= 0;
+    if (["subscription", "credit_purchase", "referral_commission", "cohost_host_earning", "cohost_referrer_earning", "escrow_release", "cohost_refund", "badge_reward"].includes(type)) return value < 0;
+    if (["referral_fee", "platform_fee", "cohost_platform_fee", "escrow_deposit", "cohost_payment"].includes(type)) return value > 0;
+    return false;
+}
+
+function maskFinancePhone(value) {
+    const text = String(value || "");
+    if (!text) return null;
+    const digits = text.replace(/\D/g, "");
+    if (digits.length <= 3) return "Ending 3";
+    return `Ending ${digits.slice(-3)}`;
+}
+
+function mapFinanceTransaction(row) {
+    const meta = financeTypeMeta(row.type);
+    return {
+        id: row.id,
+        type: row.type,
+        typeLabel: meta.label,
+        category: meta.category,
+        cashClass: meta.cashClass,
+        expectedDirection: meta.direction,
+        direction: Number(row.amount) < 0 ? "debit" : "credit",
+        amount: row.amount,
+        status: row.status,
+        reference: row.transaction_id || null,
+        description: row.description || null,
+        createdAt: row.created_at || null,
+        userId: row.creator_id,
+        userName: row.user_name || null,
+        userEmail: row.user_email || null,
+        related: inferFinanceLink(row.type, row.transaction_id, row.description)
+    };
+}
+
+async function queryFinancePeriodTotals(from, to) {
+    const result = await pool.query(`
+        WITH period AS (
+            SELECT * FROM transactions
+            WHERE created_at >= $1::date AND created_at < ($2::date + INTERVAL '1 day')
+        ), totals AS (
+            SELECT
+                COALESCE(SUM(CASE WHEN status = 'completed' AND amount > 0 AND (type IN ('subscription', 'credit_purchase') OR type = 'reactivation_fee') THEN amount ELSE 0 END), 0) AS external_receipts,
+                COUNT(*) FILTER (WHERE status = 'completed' AND amount > 0 AND (type IN ('subscription', 'credit_purchase') OR type = 'reactivation_fee'))::int AS external_receipt_count,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND type IN ('platform_fee', 'cohost_platform_fee') THEN ABS(amount) ELSE 0 END), 0) AS platform_fees,
+                COUNT(*) FILTER (WHERE status = 'completed' AND type IN ('platform_fee', 'cohost_platform_fee'))::int AS platform_fee_count,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND type IN ('subscription', 'referral_commission', 'cohost_host_earning', 'cohost_referrer_earning', 'escrow_release') THEN amount ELSE 0 END), 0) AS creator_earnings,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND (type IN ('referral_fee', 'platform_fee', 'cohost_platform_fee') OR (type = 'reactivation_fee' AND amount < 0)) THEN amount ELSE 0 END), 0) AS fee_deductions,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND type = 'payout' THEN amount ELSE 0 END), 0) AS completed_payouts_signed,
+                COUNT(*) FILTER (WHERE status = 'completed' AND type = 'payout')::int AS completed_payout_count,
+                COALESCE(SUM(CASE WHEN status = 'pending' AND type = 'payout' THEN amount ELSE 0 END), 0) AS pending_payouts_signed,
+                COUNT(*) FILTER (WHERE status = 'pending' AND type = 'payout')::int AS pending_payout_count,
+                COALESCE(SUM(CASE WHEN status = 'failed' AND type = 'payout' THEN amount ELSE 0 END), 0) AS failed_payouts_signed,
+                COUNT(*) FILTER (WHERE status = 'failed' AND type = 'payout')::int AS failed_payout_count,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND type = 'escrow_deposit' THEN ABS(amount) ELSE 0 END), 0) AS escrow_deposits,
+                COUNT(*) FILTER (WHERE status = 'completed' AND type = 'escrow_deposit')::int AS escrow_deposit_count,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND type = 'cohost_payment' THEN ABS(amount) ELSE 0 END), 0) AS cohost_payments,
+                COUNT(*) FILTER (WHERE status = 'completed' AND type = 'cohost_payment')::int AS cohost_payment_count,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND type = 'cohost_refund' THEN amount ELSE 0 END), 0) AS wallet_refunds,
+                COUNT(*) FILTER (WHERE status = 'completed' AND type = 'cohost_refund')::int AS wallet_refund_count,
+                COALESCE(SUM(CASE WHEN status = 'pending' AND created_at < NOW() - INTERVAL '24 hours' THEN ABS(amount) ELSE 0 END), 0) AS stale_pending_value,
+                COUNT(*) FILTER (WHERE status = 'pending' AND created_at < NOW() - INTERVAL '24 hours')::int AS stale_pending_count,
+                COALESCE(SUM(CASE WHEN status = 'pending' AND type = 'payout' AND created_at < NOW() - INTERVAL '24 hours' THEN ABS(amount) ELSE 0 END), 0) AS stale_pending_payout_value,
+                COUNT(*) FILTER (WHERE status = 'pending' AND type = 'payout' AND created_at < NOW() - INTERVAL '24 hours')::int AS stale_pending_payout_count,
+                COUNT(*)::int AS transaction_count,
+                (SELECT COUNT(*)::int FROM (
+                    SELECT transaction_id FROM period
+                    WHERE transaction_id IS NOT NULL AND BTRIM(transaction_id) <> ''
+                    GROUP BY transaction_id HAVING COUNT(*) > 1
+                ) duplicate_refs) AS duplicate_reference_count
+            FROM period
+        )
+        SELECT
+            external_receipts::text AS external_receipts,
+            external_receipt_count,
+            platform_fees::text AS platform_fees,
+            platform_fee_count,
+            creator_earnings::text AS creator_earnings,
+            fee_deductions::text AS fee_deductions,
+            completed_payouts_signed::text AS completed_payouts_signed,
+            completed_payout_count,
+            ABS(completed_payouts_signed)::text AS payouts_settled,
+            pending_payouts_signed::text AS pending_payouts_signed,
+            pending_payout_count,
+            ABS(pending_payouts_signed)::text AS payouts_pending,
+            failed_payouts_signed::text AS failed_payouts_signed,
+            failed_payout_count,
+            ABS(failed_payouts_signed)::text AS payouts_failed,
+            (creator_earnings + fee_deductions + completed_payouts_signed)::numeric(14,2)::text AS creator_payable,
+            (creator_earnings + fee_deductions + completed_payouts_signed + pending_payouts_signed)::numeric(14,2)::text AS creator_payable_after_pending,
+            escrow_deposits::text AS escrow_deposits,
+            escrow_deposit_count,
+            cohost_payments::text AS cohost_payments,
+            cohost_payment_count,
+            wallet_refunds::text AS wallet_refunds,
+            wallet_refund_count,
+            stale_pending_value::text AS stale_pending_value,
+            stale_pending_count,
+            stale_pending_payout_value::text AS stale_pending_payout_value,
+            stale_pending_payout_count,
+            transaction_count,
+            duplicate_reference_count
+        FROM totals
+    `, [from, to]);
+    return result.rows[0];
+}
+
+async function queryFinanceEscrowPosition() {
+    const result = await pool.query(`
+        SELECT
+            COALESCE(SUM(escrow_amount) FILTER (WHERE escrow_status = 'deposited'), 0)::text AS held,
+            COUNT(*) FILTER (WHERE escrow_status = 'deposited')::int AS held_count,
+            COALESCE(SUM(escrow_amount) FILTER (WHERE escrow_status = 'released'), 0)::text AS released,
+            COUNT(*) FILTER (WHERE escrow_status = 'released')::int AS released_count,
+            COALESCE(SUM(escrow_amount) FILTER (WHERE escrow_status = 'refunded'), 0)::text AS refunded,
+            COUNT(*) FILTER (WHERE escrow_status = 'refunded')::int AS refunded_count,
+            COALESCE(SUM(escrow_amount) FILTER (WHERE escrow_status = 'none'), 0)::text AS none,
+            COUNT(*) FILTER (WHERE escrow_status = 'none')::int AS none_count,
+            COALESCE(SUM(escrow_amount) FILTER (WHERE escrow_status NOT IN ('none', 'deposited', 'released', 'refunded')), 0)::text AS other,
+            COUNT(*) FILTER (WHERE escrow_status NOT IN ('none', 'deposited', 'released', 'refunded'))::int AS other_count,
+            COUNT(*)::int AS total_count
+        FROM campaigns
+    `);
+    return result.rows[0];
+}
+
+async function queryFinanceCredits() {
+    const result = await pool.query(`
+        SELECT
+            COALESCE(SUM(credits), 0)::text AS outstanding,
+            COUNT(*) FILTER (WHERE COALESCE(credits, 0) > 0)::int AS accounts
+        FROM users
+    `);
+    return result.rows[0];
+}
+
+async function financeExceptionMetric(sql) {
+    const result = await pool.query(sql);
+    const row = result.rows[0] || {};
+    return {
+        count: Number(row.count) || 0,
+        amount: row.amount || "0",
+        firstAt: row.first_at || null,
+        lastAt: row.last_at || null
+    };
+}
+
+async function queryFinanceExceptionSummary() {
+    const definitions = [
+        {
+            kind: "stale_pending",
+            label: "Stale pending transactions",
+            severity: "warning",
+            description: "Pending transaction rows older than 24 hours.",
+            target: "transactions",
+            issue: "stale_pending"
+        },
+        {
+            kind: "duplicate_reference",
+            label: "Duplicate references",
+            severity: "warning",
+            description: "Non-empty transaction references shared by more than one row.",
+            target: "transactions",
+            issue: "duplicate_reference"
+        },
+        {
+            kind: "missing_reference",
+            label: "Missing references",
+            severity: "warning",
+            description: "External receipt, deposit, co-host, or payout rows without a reference.",
+            target: "transactions",
+            issue: "missing_reference"
+        },
+        {
+            kind: "sign_anomaly",
+            label: "Amount sign anomalies",
+            severity: "danger",
+            description: "Amount signs that contradict the stored transaction type.",
+            target: "transactions",
+            issue: "sign_anomaly"
+        },
+        {
+            kind: "split_missing",
+            label: "Missing subscription splits",
+            severity: "warning",
+            description: "Completed subscription rows without a revenue split.",
+            target: "transactions",
+            issue: "split_missing"
+        },
+        {
+            kind: "split_mismatch",
+            label: "Subscription split mismatches",
+            severity: "danger",
+            description: "Revenue split totals or components that do not match the subscription row.",
+            target: "transactions",
+            issue: "split_mismatch"
+        },
+        {
+            kind: "payout_reference_local",
+            label: "Payouts without provider receipts",
+            severity: "warning",
+            description: "Completed payouts that still have a local reference instead of a provider receipt.",
+            target: "transactions",
+            issue: "payout_reference_local"
+        },
+        {
+            kind: "escrow_missing_deposit",
+            label: "Escrows without linked deposits",
+            severity: "danger",
+            description: "Campaigns marked deposited without a matching escrow deposit transaction.",
+            target: "escrow",
+            issue: "missing_deposit"
+        },
+        {
+            kind: "escrow_missing_release",
+            label: "Escrows without linked releases",
+            severity: "danger",
+            description: "Campaigns marked released without a matching escrow release transaction.",
+            target: "escrow",
+            issue: "missing_release"
+        },
+        {
+            kind: "escrow_deposit_mismatch",
+            label: "Escrow deposit mismatches",
+            severity: "warning",
+            description: "Deposited campaign totals that do not match linked deposit transactions.",
+            target: "escrow",
+            issue: "deposit_mismatch"
+        },
+        {
+            kind: "escrow_missing_provider_ref",
+            label: "Escrows without provider references",
+            severity: "warning",
+            description: "M-Pesa campaigns without a stored provider reference.",
+            target: "escrow",
+            issue: "missing_provider_ref"
+        }
+    ];
+
+    const metrics = await Promise.all([
+        financeExceptionMetric(`SELECT COUNT(*)::int AS count, COALESCE(SUM(ABS(amount)), 0)::text AS amount, to_char(MIN(created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS first_at, to_char(MAX(created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS last_at FROM transactions WHERE status = 'pending' AND created_at < NOW() - INTERVAL '24 hours'`),
+        financeExceptionMetric(`WITH duplicate_refs AS (SELECT transaction_id, SUM(ABS(amount)) AS amount, MIN(created_at) AS first_at, MAX(created_at) AS last_at FROM transactions WHERE transaction_id IS NOT NULL AND BTRIM(transaction_id) <> '' GROUP BY transaction_id HAVING COUNT(*) > 1) SELECT COUNT(*)::int AS count, COALESCE(SUM(amount), 0)::text AS amount, to_char(MIN(first_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS first_at, to_char(MAX(last_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS last_at FROM duplicate_refs`),
+        financeExceptionMetric(`SELECT COUNT(*)::int AS count, COALESCE(SUM(ABS(amount)), 0)::text AS amount, to_char(MIN(created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS first_at, to_char(MAX(created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS last_at FROM transactions WHERE (transaction_id IS NULL OR BTRIM(transaction_id) = '') AND type IN ('subscription', 'credit_purchase', 'payout', 'escrow_deposit', 'cohost_payment') AND status IN ('pending', 'completed')`),
+        financeExceptionMetric(`SELECT COUNT(*)::int AS count, COALESCE(SUM(ABS(amount)), 0)::text AS amount, to_char(MIN(created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS first_at, to_char(MAX(created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS last_at FROM transactions WHERE status IN ('pending', 'completed') AND ((type = 'payout' AND amount >= 0) OR (type IN ('subscription', 'credit_purchase', 'referral_commission', 'cohost_host_earning', 'cohost_referrer_earning', 'escrow_release', 'cohost_refund', 'badge_reward') AND amount < 0) OR (type IN ('referral_fee', 'platform_fee', 'cohost_platform_fee', 'escrow_deposit', 'cohost_payment') AND amount > 0))`),
+        financeExceptionMetric(`SELECT COUNT(*)::int AS count, COALESCE(SUM(ABS(t.amount)), 0)::text AS amount, to_char(MIN(t.created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS first_at, to_char(MAX(t.created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS last_at FROM transactions t WHERE t.type = 'subscription' AND t.status = 'completed' AND NOT EXISTS (SELECT 1 FROM revenue_splits rs WHERE rs.transaction_id = t.transaction_id)`),
+        financeExceptionMetric(`SELECT COUNT(*)::int AS count, COALESCE(SUM(ABS(t.amount)), 0)::text AS amount, to_char(MIN(t.created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS first_at, to_char(MAX(t.created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS last_at FROM transactions t WHERE t.type = 'subscription' AND t.status = 'completed' AND EXISTS (SELECT 1 FROM revenue_splits rs WHERE rs.transaction_id = t.transaction_id AND (rs.total_amount <> t.amount OR rs.creator_amount + COALESCE(rs.referrer_amount, 0) + COALESCE(rs.platform_amount, 0) <> rs.total_amount))`),
+        financeExceptionMetric(`SELECT COUNT(*)::int AS count, COALESCE(SUM(ABS(amount)), 0)::text AS amount, to_char(MIN(created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS first_at, to_char(MAX(created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS last_at FROM transactions WHERE type = 'payout' AND status = 'completed' AND (transaction_id IS NULL OR BTRIM(transaction_id) = '' OR transaction_id LIKE 'PAYOUT-%')`),
+        financeExceptionMetric(`SELECT COUNT(*)::int AS count, COALESCE(SUM(c.escrow_amount), 0)::text AS amount, to_char(MIN(c.created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS first_at, to_char(MAX(c.created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS last_at FROM campaigns c WHERE c.escrow_status = 'deposited' AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.type = 'escrow_deposit' AND t.description LIKE 'Escrow deposit for campaign #' || c.id || ':%')`),
+        financeExceptionMetric(`SELECT COUNT(*)::int AS count, COALESCE(SUM(c.escrow_amount), 0)::text AS amount, to_char(MIN(c.created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS first_at, to_char(MAX(c.created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS last_at FROM campaigns c WHERE c.escrow_status = 'released' AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.type = 'escrow_release' AND t.description LIKE 'Campaign sponsorship payout for #' || c.id || '%')`),
+        financeExceptionMetric(`SELECT COUNT(*)::int AS count, COALESCE(SUM(c.escrow_amount), 0)::text AS amount, to_char(MIN(c.created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS first_at, to_char(MAX(c.created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS last_at FROM campaigns c WHERE c.escrow_status = 'deposited' AND COALESCE((SELECT SUM(ABS(t.amount)) FROM transactions t WHERE t.type = 'escrow_deposit' AND t.description LIKE 'Escrow deposit for campaign #' || c.id || ':%'), 0) <> c.escrow_amount`),
+        financeExceptionMetric(`SELECT COUNT(*)::int AS count, COALESCE(SUM(c.escrow_amount), 0)::text AS amount, to_char(MIN(c.created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS first_at, to_char(MAX(c.created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS last_at FROM campaigns c WHERE c.payment_method = 'mpesa' AND c.escrow_status IN ('deposited', 'released') AND (c.mpesa_transaction_id IS NULL OR BTRIM(c.mpesa_transaction_id) = '')`)
+    ]);
+
+    const items = definitions.map((definition, index) => ({ ...definition, ...metrics[index] }));
+    return {
+        generatedAt: new Date().toISOString(),
+        totalIssues: items.reduce((total, item) => total + item.count, 0),
+        items,
+        providerSettlementAvailable: false,
+        limitations: FINANCE_KNOWN_LIMITATIONS
+    };
+}
+
+function buildFinanceTransactionFilters(query) {
+    const range = parseFinanceDateRange(query, 30);
+    if (range.error) return { error: range.error };
+
+    const q = typeof query.q === "string" ? query.q.trim().slice(0, 120) : "";
+    const flow = typeof query.flow === "string" ? query.flow : "all";
+    const type = typeof query.type === "string" ? query.type : "all";
+    const status = typeof query.status === "string" ? query.status : "all";
+    const direction = typeof query.direction === "string" ? query.direction : "all";
+    const issue = typeof query.issue === "string" ? query.issue : "all";
+    const userId = query.user_id === undefined || query.user_id === "" ? null : parseFinanceId(query.user_id);
+    const minAmount = parseFinanceAmount(query.min_amount, "min_amount");
+    const maxAmount = parseFinanceAmount(query.max_amount, "max_amount");
+    const limit = parseBoundedInt(query.limit, 25, 1, 100);
+    const offset = parseBoundedInt(query.offset, 0, 0, 1000000);
+    const sort = typeof query.sort === "string" ? query.sort : "created_at";
+    const order = typeof query.order === "string" ? query.order.toLowerCase() : "desc";
+
+    if (minAmount.error) return { error: minAmount.error };
+    if (maxAmount.error) return { error: maxAmount.error };
+    if (minAmount.value && maxAmount.value && Number(minAmount.value) > Number(maxAmount.value)) {
+        return { error: "min_amount must be less than or equal to max_amount" };
+    }
+    if (flow !== "all" && !FINANCE_FLOWS[flow]) return { error: "Invalid flow filter" };
+    if (type !== "all" && !FINANCE_TYPE_VALUES.includes(type)) return { error: "Invalid transaction type filter" };
+    if (status !== "all" && !FINANCE_STATUS_VALUES.includes(status)) return { error: "Invalid status filter" };
+    if (direction !== "all" && !["credit", "debit"].includes(direction)) return { error: "Invalid direction filter" };
+    if (issue !== "all" && !FINANCE_TRANSACTION_ISSUE_VALUES.includes(issue)) return { error: "Invalid issue filter" };
+    if (query.user_id !== undefined && query.user_id !== "" && !userId) return { error: "Invalid user_id" };
+    if (limit === null) return { error: "Limit must be between 1 and 100" };
+    if (offset === null) return { error: "Offset is invalid" };
+    if (!["created_at", "amount", "id", "type", "status"].includes(sort)) return { error: "Invalid sort field" };
+    if (!["asc", "desc"].includes(order)) return { error: "Invalid sort order" };
+
+    const where = ["t.created_at >= $1::date", "t.created_at < ($2::date + INTERVAL '1 day')"];
+    const params = [range.from, range.to];
+
+    if (q) {
+        const escaped = escapeLikeValue(q);
+        const idParam = params.length + 1;
+        const likeParam = params.length + 2;
+        params.push(q, `%${escaped}%`, `%${escaped}%`, `%${escaped}%`);
+        where.push(`(t.id::text = $${idParam} OR t.transaction_id ILIKE $${likeParam} OR t.description ILIKE $${likeParam + 1} OR u.name ILIKE $${likeParam + 2} OR u.email ILIKE $${likeParam + 2})`);
+    }
+    if (flow !== "all") where.push(financeFlowCondition(flow, "t"));
+    if (type !== "all") {
+        params.push(type);
+        where.push(`t.type = $${params.length}`);
+    }
+    if (status !== "all") {
+        params.push(status);
+        where.push(`t.status = $${params.length}`);
+    }
+    if (direction !== "all") {
+        where.push(direction === "credit" ? "t.amount > 0" : "t.amount < 0");
+    }
+    if (issue !== "all") where.push(financeIssueCondition(issue, "t"));
+    if (userId) {
+        params.push(userId);
+        where.push(`t.creator_id = $${params.length}`);
+    }
+    if (minAmount.value) {
+        params.push(minAmount.value);
+        where.push(`ABS(t.amount) >= $${params.length}::numeric`);
+    }
+    if (maxAmount.value) {
+        params.push(maxAmount.value);
+        where.push(`ABS(t.amount) <= $${params.length}::numeric`);
+    }
+
+    const sortExpressions = {
+        created_at: "t.created_at",
+        amount: "ABS(t.amount)",
+        id: "t.id",
+        type: "t.type",
+        status: "t.status"
+    };
+    const directionSql = order === "asc" ? "ASC" : "DESC";
+
+    return {
+        range,
+        q,
+        flow,
+        type,
+        status,
+        direction,
+        issue,
+        userId,
+        minAmount: minAmount.value,
+        maxAmount: maxAmount.value,
+        limit,
+        offset,
+        sort,
+        order,
+        whereSql: `WHERE ${where.join(" AND ")}`,
+        params,
+        orderSql: `ORDER BY ${sortExpressions[sort]} ${directionSql} NULLS LAST, t.id ${directionSql}`
+    };
+}
+
+async function queryFinanceTransactions(filters) {
+    const dataParams = [...filters.params, filters.limit, filters.offset];
+    const result = await pool.query(`
+        SELECT
+            t.id, t.creator_id, t.type, t.amount::text AS amount, t.status, t.transaction_id,
+            t.description, to_char(t.created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at,
+            u.name AS user_name, u.email AS user_email,
+            COUNT(*) OVER()::int AS total_count,
+            COALESCE(SUM(t.amount) OVER(), 0)::text AS total_signed_amount,
+            COALESCE(SUM(CASE WHEN t.amount > 0 THEN t.amount ELSE 0 END) OVER(), 0)::text AS total_credit,
+            COALESCE(SUM(CASE WHEN t.amount < 0 THEN t.amount ELSE 0 END) OVER(), 0)::text AS total_debit
+        FROM transactions t
+        LEFT JOIN users u ON u.id = t.creator_id
+        ${filters.whereSql}
+        ${filters.orderSql}
+        LIMIT $${filters.params.length + 1} OFFSET $${filters.params.length + 2}
+    `, dataParams);
+    return result.rows;
+}
+
+function buildFinancePayoutFilters(query) {
+    const range = parseFinanceDateRange(query, 30);
+    if (range.error) return { error: range.error };
+
+    const q = typeof query.q === "string" ? query.q.trim().slice(0, 120) : "";
+    const status = typeof query.status === "string" ? query.status : "all";
+    const issue = typeof query.issue === "string" ? query.issue : "all";
+    const limit = parseBoundedInt(query.limit, 25, 1, 100);
+    const offset = parseBoundedInt(query.offset, 0, 0, 1000000);
+    const sort = typeof query.sort === "string" ? query.sort : "created_at";
+    const order = typeof query.order === "string" ? query.order.toLowerCase() : "desc";
+
+    if (status !== "all" && !FINANCE_STATUS_VALUES.includes(status)) return { error: "Invalid status filter" };
+    if (issue !== "all" && !FINANCE_PAYOUT_ISSUES.includes(issue)) return { error: "Invalid issue filter" };
+    if (limit === null) return { error: "Limit must be between 1 and 100" };
+    if (offset === null) return { error: "Offset is invalid" };
+    if (!["created_at", "amount", "id"].includes(sort)) return { error: "Invalid sort field" };
+    if (!["asc", "desc"].includes(order)) return { error: "Invalid sort order" };
+
+    const where = ["t.type = 'payout'", "t.created_at >= $1::date", "t.created_at < ($2::date + INTERVAL '1 day')"];
+    const params = [range.from, range.to];
+
+    if (q) {
+        const escaped = escapeLikeValue(q);
+        const idParam = params.length + 1;
+        const likeParam = params.length + 2;
+        params.push(q, `%${escaped}%`, `%${escaped}%`, `%${escaped}%`);
+        where.push(`(t.id::text = $${idParam} OR t.transaction_id ILIKE $${likeParam} OR t.description ILIKE $${likeParam + 1} OR u.name ILIKE $${likeParam + 2} OR u.email ILIKE $${likeParam + 2})`);
+    }
+    if (status !== "all") {
+        params.push(status);
+        where.push(`t.status = $${params.length}`);
+    }
+    if (issue !== "all") where.push(financeIssueCondition(issue, "t"));
+
+    const sortExpressions = { created_at: "t.created_at", amount: "ABS(t.amount)", id: "t.id" };
+    const directionSql = order === "asc" ? "ASC" : "DESC";
+    return {
+        range,
+        q,
+        status,
+        issue,
+        limit,
+        offset,
+        sort,
+        order,
+        whereSql: `WHERE ${where.join(" AND ")}`,
+        params,
+        orderSql: `ORDER BY ${sortExpressions[sort]} ${directionSql} NULLS LAST, t.id ${directionSql}`
+    };
+}
+
+async function queryFinancePayouts(filters) {
+    const dataParams = [...filters.params, filters.limit, filters.offset];
+    const result = await pool.query(`
+        SELECT
+            t.id, t.creator_id, t.type, t.amount::text AS amount, t.status, t.transaction_id,
+            t.description, to_char(t.created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at,
+            u.name AS user_name, u.email AS user_email,
+            ps.payment_method, ps.payout_threshold::text AS payout_threshold, ps.mpesa_phone,
+            EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 3600 AS age_hours,
+            COUNT(*) OVER()::int AS total_count
+        FROM transactions t
+        LEFT JOIN users u ON u.id = t.creator_id
+        LEFT JOIN payout_settings ps ON ps.creator_id = t.creator_id
+        ${filters.whereSql}
+        ${filters.orderSql}
+        LIMIT $${filters.params.length + 1} OFFSET $${filters.params.length + 2}
+    `, dataParams);
+    return result.rows;
+}
+
+function buildFinanceEscrowFilters(query) {
+    const range = parseFinanceDateRange(query, 90);
+    if (range.error) return { error: range.error };
+
+    const q = typeof query.q === "string" ? query.q.trim().slice(0, 120) : "";
+    const escrowStatus = typeof query.escrow_status === "string" ? query.escrow_status : "all";
+    const campaignStatus = typeof query.status === "string" ? query.status : "all";
+    const issue = typeof query.issue === "string" ? query.issue : "all";
+    const limit = parseBoundedInt(query.limit, 25, 1, 100);
+    const offset = parseBoundedInt(query.offset, 0, 0, 1000000);
+    const sort = typeof query.sort === "string" ? query.sort : "created_at";
+    const order = typeof query.order === "string" ? query.order.toLowerCase() : "desc";
+    const allowedEscrowStatuses = ["all", "none", "deposited", "released", "refunded", "pending_deposit", "deposit_failed"];
+
+    if (!allowedEscrowStatuses.includes(escrowStatus)) return { error: "Invalid escrow status filter" };
+    if (campaignStatus !== "all" && !["open", "in_progress", "completed", "cancelled"].includes(campaignStatus)) return { error: "Invalid campaign status filter" };
+    if (issue !== "all" && !FINANCE_ESCROW_ISSUE_VALUES.includes(issue)) return { error: "Invalid issue filter" };
+    if (limit === null) return { error: "Limit must be between 1 and 100" };
+    if (offset === null) return { error: "Offset is invalid" };
+    if (!["created_at", "budget", "escrow_amount", "id"].includes(sort)) return { error: "Invalid sort field" };
+    if (!["asc", "desc"].includes(order)) return { error: "Invalid sort order" };
+
+    const where = ["c.created_at >= $1::date", "c.created_at < ($2::date + INTERVAL '1 day')"];
+    const params = [range.from, range.to];
+
+    if (q) {
+        const escaped = escapeLikeValue(q);
+        const idParam = params.length + 1;
+        const likeParam = params.length + 2;
+        params.push(q, `%${escaped}%`, `%${escaped}%`, `%${escaped}%`);
+        where.push(`(c.id::text = $${idParam} OR c.title ILIKE $${likeParam} OR u.name ILIKE $${likeParam + 1} OR cu.name ILIKE $${likeParam + 2})`);
+    }
+    if (escrowStatus !== "all") {
+        params.push(escrowStatus);
+        where.push(`c.escrow_status = $${params.length}`);
+    }
+    if (campaignStatus !== "all") {
+        params.push(campaignStatus);
+        where.push(`c.status = $${params.length}`);
+    }
+    if (issue !== "all") where.push(financeEscrowIssueCondition(issue, "c"));
+
+    const sortExpressions = { created_at: "c.created_at", budget: "c.budget", escrow_amount: "c.escrow_amount", id: "c.id" };
+    const directionSql = order === "asc" ? "ASC" : "DESC";
+    return {
+        range,
+        q,
+        escrowStatus,
+        campaignStatus,
+        issue,
+        limit,
+        offset,
+        sort,
+        order,
+        whereSql: `WHERE ${where.join(" AND ")}`,
+        params,
+        orderSql: `ORDER BY ${sortExpressions[sort]} ${directionSql} NULLS LAST, c.id ${directionSql}`
+    };
+}
+
+function financeEscrowFlags(row) {
+    const flags = [];
+    if (row.escrow_status === "deposited" && Number(row.deposit_count) === 0) {
+        flags.push({ code: "missing_deposit", message: "No escrow deposit transaction is linked to this campaign." });
+    }
+    if (row.escrow_status === "released" && Number(row.release_count) === 0) {
+        flags.push({ code: "missing_release", message: "No escrow release transaction is linked to this campaign." });
+    }
+    if (row.payment_method === "mpesa" && ["deposited", "released"].includes(row.escrow_status) && !row.mpesa_transaction_id) {
+        flags.push({ code: "missing_provider_ref", message: "M-Pesa funding has no stored provider reference." });
+    }
+    if (row.escrow_status === "deposited" && Number(row.deposit_count) > 0 && Number(row.deposit_amount) !== Number(row.escrow_amount)) {
+        flags.push({ code: "deposit_mismatch", message: "Linked deposit total does not match the campaign escrow amount." });
+    }
+    if (row.status === "completed" && row.escrow_status !== "released") {
+        flags.push({ code: "completed_not_released", message: "Campaign is completed but escrow is not marked released." });
+    }
+    if (row.status === "cancelled" && row.escrow_status === "deposited") {
+        flags.push({ code: "cancelled_escrow_held", message: "Campaign is cancelled while escrow is still marked deposited." });
+    }
+    return flags;
+}
+
+function mapFinanceEscrow(row) {
+    return {
+        id: row.id,
+        title: row.title,
+        businessId: row.business_id,
+        businessName: row.business_name || null,
+        budget: row.budget === null || row.budget === undefined ? null : String(row.budget),
+        escrowAmount: row.escrow_amount === null || row.escrow_amount === undefined ? "0" : String(row.escrow_amount),
+        escrowStatus: row.escrow_status || "none",
+        campaignStatus: row.status,
+        paymentMethod: row.payment_method || null,
+        reference: row.mpesa_transaction_id || null,
+        createdAt: row.created_at || null,
+        deadline: row.deadline || null,
+        selectedProposalId: row.selected_proposal_id || null,
+        creatorId: row.creator_id || null,
+        creatorName: row.creator_name || null,
+        proposalStatus: row.proposal_status || null,
+        depositCount: Number(row.deposit_count) || 0,
+        depositAmount: row.deposit_amount || "0",
+        releaseCount: Number(row.release_count) || 0,
+        releaseAmount: row.release_amount || "0",
+        lastActivityAt: row.last_activity_at || null,
+        flags: financeEscrowFlags(row)
+    };
+}
+
+async function queryFinanceEscrows(filters) {
+    const dataParams = [...filters.params, filters.limit, filters.offset];
+    const result = await pool.query(`
+        SELECT
+            c.id, c.business_id, c.title, c.budget, c.escrow_amount, c.escrow_status, c.status,
+            c.payment_method, c.mpesa_transaction_id, c.selected_proposal_id,
+            to_char(c.created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at,
+            to_char(c.deadline, 'YYYY-MM-DD"T"HH24:MI:SS') AS deadline,
+            u.name AS business_name,
+            cp.creator_id, cp.status AS proposal_status, cu.name AS creator_name,
+            COALESCE(rel.deposit_count, 0)::int AS deposit_count,
+            COALESCE(rel.deposit_amount, 0)::text AS deposit_amount,
+            COALESCE(rel.release_count, 0)::int AS release_count,
+            COALESCE(rel.release_amount, 0)::text AS release_amount,
+            to_char(rel.last_activity_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS last_activity_at,
+            COUNT(*) OVER()::int AS total_count
+        FROM campaigns c
+        LEFT JOIN users u ON u.id = c.business_id
+        LEFT JOIN campaign_proposals cp ON cp.id = c.selected_proposal_id
+        LEFT JOIN users cu ON cu.id = cp.creator_id
+        LEFT JOIN LATERAL (
+            SELECT
+                COUNT(*) FILTER (WHERE t.type = 'escrow_deposit')::int AS deposit_count,
+                COALESCE(SUM(ABS(t.amount)) FILTER (WHERE t.type = 'escrow_deposit'), 0) AS deposit_amount,
+                COUNT(*) FILTER (WHERE t.type = 'escrow_release')::int AS release_count,
+                COALESCE(SUM(t.amount) FILTER (WHERE t.type = 'escrow_release'), 0) AS release_amount,
+                MAX(t.created_at) AS last_activity_at
+            FROM transactions t
+            WHERE t.description LIKE 'Escrow deposit for campaign #' || c.id || ':%'
+               OR t.description LIKE 'Campaign sponsorship payout for #' || c.id || '%'
+        ) rel ON TRUE
+        ${filters.whereSql}
+        ${filters.orderSql}
+        LIMIT $${filters.params.length + 1} OFFSET $${filters.params.length + 2}
+    `, dataParams);
+    return result.rows;
+}
+
+async function queryFinanceAudit(limit, offset) {
+    const result = await pool.query(`
+        SELECT
+            a.id, a.action, a.target_type, a.target_id, a.reason, a.after_state, a.request_id,
+            to_char(a.created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at,
+            u.name AS actor_name,
+            COUNT(*) OVER()::int AS total_count
+        FROM admin_audit_log a
+        LEFT JOIN users u ON u.id = a.actor_id
+        WHERE a.action LIKE 'finance.%'
+        ORDER BY a.created_at DESC, a.id DESC
+        LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+    return result.rows;
+}
+
+async function writeFinanceAudit(req, action, targetType, targetId, reason, afterState) {
+    await pool.query(`
+        INSERT INTO admin_audit_log (actor_id, action, target_type, target_id, reason, after_state, request_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `, [req.staff.id, action, targetType, targetId, reason, JSON.stringify(afterState || {}), getRequestId(req)]);
+}
+
+function csvEscape(value) {
+    const text = value === null || value === undefined ? "" : String(value);
+    const safe = /^[=+\-@]/.test(text) ? `'${text}` : text;
+    return `"${safe.replace(/"/g, '""')}"`;
+}
+
+function csvNumber(value) {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric.toFixed(2) : "0.00";
+}
+
+function sendFinanceCsv(res, filename, headers, rows, numericColumns) {
+    const numericSet = new Set(numericColumns || []);
+    const lines = [
+        headers.map(csvEscape).join(","),
+        ...rows.map((row) => row.map((cell, index) => (numericSet.has(index) ? csvNumber(cell) : csvEscape(cell))).join(","))
+    ];
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.send(lines.join("\n"));
+}
+
+async function queryFinancePayoutBalance(creatorId) {
+    const result = await pool.query(`
+        SELECT
+            COALESCE(SUM(CASE WHEN status = 'completed' AND type IN ('subscription', 'referral_commission', 'cohost_host_earning', 'cohost_referrer_earning', 'escrow_release') THEN amount ELSE 0 END), 0)::text AS earnings,
+            COALESCE(SUM(CASE WHEN status = 'completed' AND (type IN ('referral_fee', 'platform_fee', 'cohost_platform_fee') OR (type = 'reactivation_fee' AND amount < 0)) THEN amount ELSE 0 END), 0)::text AS fee_deductions,
+            COALESCE(SUM(CASE WHEN status = 'completed' AND type = 'payout' THEN amount ELSE 0 END), 0)::text AS completed_payouts,
+            COALESCE(SUM(CASE WHEN status = 'pending' AND type = 'payout' THEN amount ELSE 0 END), 0)::text AS pending_payouts,
+            (COALESCE(SUM(CASE WHEN status = 'completed' AND type IN ('subscription', 'referral_commission', 'cohost_host_earning', 'cohost_referrer_earning', 'escrow_release') THEN amount ELSE 0 END), 0)
+             + COALESCE(SUM(CASE WHEN status = 'completed' AND (type IN ('referral_fee', 'platform_fee', 'cohost_platform_fee') OR (type = 'reactivation_fee' AND amount < 0)) THEN amount ELSE 0 END), 0)
+             + COALESCE(SUM(CASE WHEN status = 'completed' AND type = 'payout' THEN amount ELSE 0 END), 0))::numeric(14,2)::text AS payable,
+            (COALESCE(SUM(CASE WHEN status = 'completed' AND type IN ('subscription', 'referral_commission', 'cohost_host_earning', 'cohost_referrer_earning', 'escrow_release') THEN amount ELSE 0 END), 0)
+             + COALESCE(SUM(CASE WHEN status = 'completed' AND (type IN ('referral_fee', 'platform_fee', 'cohost_platform_fee') OR (type = 'reactivation_fee' AND amount < 0)) THEN amount ELSE 0 END), 0)
+             + COALESCE(SUM(CASE WHEN status = 'completed' AND type = 'payout' THEN amount ELSE 0 END), 0)
+             + COALESCE(SUM(CASE WHEN status = 'pending' AND type = 'payout' THEN amount ELSE 0 END), 0))::numeric(14,2)::text AS payable_after_pending
+        FROM transactions
+        WHERE creator_id = $1
+    `, [creatorId]);
+    return result.rows[0];
+}
+
+async function loadFinanceTransactionDetail(id) {
+    const result = await pool.query(`
+        SELECT
+            t.id, t.creator_id, t.type, t.amount::text AS amount, t.status, t.transaction_id,
+            t.description, to_char(t.created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at,
+            (t.status = 'pending' AND t.created_at < NOW() - INTERVAL '24 hours') AS is_stale,
+            u.name AS user_name, u.email AS user_email
+        FROM transactions t
+        LEFT JOIN users u ON u.id = t.creator_id
+        WHERE t.id = $1
+    `, [id]);
+    if (result.rowCount === 0) return null;
+
+    const row = result.rows[0];
+    const transaction = mapFinanceTransaction(row);
+    const link = transaction.related;
+    const flags = [];
+    const limitations = [...FINANCE_KNOWN_LIMITATIONS];
+    let related = { kind: link.kind, id: link.id, confidence: link.confidence, record: null };
+    let allocations = [];
+    let linkedTransactions = [];
+
+    if (row.is_stale) {
+        flags.push({ code: "stale_pending", message: "Pending for more than 24 hours." });
+    }
+    if (["subscription", "credit_purchase", "payout", "escrow_deposit", "cohost_payment"].includes(transaction.type) && !transaction.reference) {
+        flags.push({ code: "missing_reference", message: "No reference is stored for this movement." });
+    }
+    if (financeSignAnomaly(transaction.type, transaction.amount)) {
+        flags.push({ code: "sign_anomaly", message: "The amount sign contradicts the transaction type." });
+    }
+    if (transaction.reference) {
+        const duplicate = await pool.query(
+            "SELECT COUNT(*)::int AS count FROM transactions WHERE transaction_id = $1 AND id <> $2",
+            [transaction.reference, transaction.id]
+        );
+        if (Number(duplicate.rows[0].count) > 0) {
+            flags.push({ code: "duplicate_reference", message: `This reference appears on ${duplicate.rows[0].count} other transaction row(s).` });
+        }
+    }
+    if (transaction.type === "payout" && transaction.status === "completed" && /^PAYOUT-/.test(transaction.reference || "")) {
+        flags.push({ code: "payout_reference_local", message: "Completed payout still has a local reference instead of a provider receipt." });
+    }
+
+    if (link.kind === "subscription") {
+        const subscription = await pool.query(`
+            SELECT s.id, s.user_id, s.creator_id, s.plan, s.amount::text AS amount,
+                   s.payment_method, s.mpesa_transaction_id, s.payment_status,
+                   to_char(s.start_date, 'YYYY-MM-DD') AS start_date,
+                   to_char(s.end_date, 'YYYY-MM-DD') AS end_date,
+                   cu.name AS creator_name, uu.name AS subscriber_name
+            FROM subscriptions s
+            LEFT JOIN users cu ON cu.id = s.creator_id
+            LEFT JOIN users uu ON uu.id = s.user_id
+            WHERE s.id = $1
+        `, [link.id]);
+        if (subscription.rowCount === 0) {
+            flags.push({ code: "missing_subscription", message: "The inferred subscription record does not exist." });
+        } else {
+            related.record = subscription.rows[0];
+        }
+        const splitResult = await pool.query(`
+            SELECT id, total_amount::text, creator_amount::text, referrer_amount::text,
+                   platform_amount::text, referrer_tier, referrer_active, active_referral_count,
+                   to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at
+            FROM revenue_splits
+            WHERE transaction_id = $1 OR subscription_id = $2
+            ORDER BY id
+        `, [transaction.reference, link.id]);
+        allocations = splitResult.rows;
+        if (transaction.status === "completed" && allocations.length === 0) {
+            flags.push({ code: "split_missing", message: "No revenue split is linked to this completed subscription." });
+        }
+    }
+
+    if (link.kind === "cohost_request") {
+        const request = await pool.query(`
+            SELECT r.id, r.guest_id, r.host_id, r.status, r.price::text AS price,
+                   r.payment_method, r.payment_status, r.mpesa_transaction_id,
+                   g.name AS guest_name, h.name AS host_name
+            FROM cohost_requests r
+            LEFT JOIN users g ON g.id = r.guest_id
+            LEFT JOIN users h ON h.id = r.host_id
+            WHERE r.id = $1
+        `, [link.id]);
+        if (request.rowCount === 0) {
+            flags.push({ code: "missing_cohost_request", message: "The inferred co-host request does not exist." });
+        } else {
+            related.record = request.rows[0];
+        }
+        const cohostPayments = await pool.query(`
+            SELECT id, creator_id, type, amount::text AS amount, status, transaction_id,
+                   description, to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at
+            FROM transactions
+            WHERE (transaction_id IN ($1, 'CH-' || $1, 'CHR-' || $1, 'CHPF-' || $1)
+                   OR description ILIKE '%request #' || $2 || '%')
+            ORDER BY created_at DESC, id DESC
+        `, [transaction.reference || "", link.id]);
+        linkedTransactions = cohostPayments.rows;
+        if (linkedTransactions.length === 0) {
+            flags.push({ code: "missing_cohost_link", message: "No co-host transaction rows are linked to this request." });
+        }
+    }
+
+    if (link.kind === "campaign") {
+        const campaign = await pool.query(`
+            SELECT c.id, c.business_id, c.title, c.budget::text AS budget, c.escrow_amount::text AS escrow_amount,
+                   c.escrow_status, c.status, c.payment_method, c.mpesa_transaction_id,
+                   to_char(c.created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at,
+                   u.name AS business_name, cp.creator_id, cp.status AS proposal_status, cu.name AS creator_name
+            FROM campaigns c
+            LEFT JOIN users u ON u.id = c.business_id
+            LEFT JOIN campaign_proposals cp ON cp.id = c.selected_proposal_id
+            LEFT JOIN users cu ON cu.id = cp.creator_id
+            WHERE c.id = $1
+        `, [link.id]);
+        if (campaign.rowCount === 0) {
+            flags.push({ code: "missing_campaign", message: "The inferred campaign record does not exist." });
+        } else {
+            related.record = campaign.rows[0];
+        }
+        const campaignTransactions = await pool.query(`
+            SELECT id, creator_id, type, amount::text AS amount, status, transaction_id,
+                   description, to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at
+            FROM transactions
+            WHERE (type = 'escrow_deposit' AND description LIKE 'Escrow deposit for campaign #' || $1 || ':%')
+               OR (type = 'escrow_release' AND description LIKE 'Campaign sponsorship payout for #' || $1 || '%')
+            ORDER BY created_at DESC, id DESC
+        `, [link.id]);
+        linkedTransactions = campaignTransactions.rows;
+        if (linkedTransactions.length === 0) {
+            flags.push({ code: "missing_campaign_link", message: "No escrow transaction rows are linked to this campaign." });
+        }
+    }
+
+    if (transaction.type === "payout") {
+        const settings = await pool.query(`
+            SELECT payment_method, payout_threshold::text AS payout_threshold,
+                   email_notifications, mpesa_phone
+            FROM payout_settings WHERE creator_id = $1
+        `, [transaction.userId]);
+        const recent = await pool.query(`
+            SELECT id, type, amount::text AS amount, status, transaction_id,
+                   description, to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at
+            FROM transactions
+            WHERE creator_id = $1 AND type = 'payout'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 10
+        `, [transaction.userId]);
+        const balance = await queryFinancePayoutBalance(transaction.userId);
+        related.record = {
+            settings: settings.rows[0] ? {
+                paymentMethod: settings.rows[0].payment_method,
+                payoutThreshold: settings.rows[0].payout_threshold,
+                emailNotifications: settings.rows[0].email_notifications,
+                maskedPhone: maskFinancePhone(settings.rows[0].mpesa_phone)
+            } : null,
+            recentPayouts: recent.rows,
+            balance: {
+                earnings: balance.earnings,
+                feeDeductions: balance.fee_deductions,
+                completedPayouts: balance.completed_payouts,
+                pendingPayouts: balance.pending_payouts,
+                payable: balance.payable,
+                payableAfterPending: balance.payable_after_pending
+            }
+        };
+    }
+
+    if (link.kind === "account") {
+        const account = await pool.query(
+            "SELECT id, name, email, role, account_type, account_status FROM users WHERE id = $1",
+            [link.id]
+        );
+        related.record = account.rows[0] || null;
+    }
+
+    return {
+        transaction,
+        account: {
+            id: row.creator_id,
+            name: row.user_name || null,
+            email: row.user_email || null
+        },
+        related,
+        allocations,
+        linkedTransactions,
+        flags,
+        limitations
+    };
+}
+
+function financePagination(total, limit, offset) {
+    const safeTotal = Number(total) || 0;
+    return {
+        limit,
+        offset,
+        total: safeTotal,
+        page: Math.floor(offset / limit) + 1,
+        pages: safeTotal === 0 ? 0 : Math.ceil(safeTotal / limit)
+    };
+}
+
+function mapFinancePayout(row) {
+    return {
+        id: row.id,
+        creator: {
+            id: row.creator_id,
+            name: row.user_name || null,
+            email: row.user_email || null
+        },
+        amount: row.amount,
+        status: row.status,
+        reference: row.transaction_id || null,
+        description: row.description || null,
+        createdAt: row.created_at || null,
+        ageHours: row.age_hours === null || row.age_hours === undefined ? null : Number(row.age_hours),
+        currentMethod: row.payment_method || null,
+        maskedDestination: maskFinancePhone(row.mpesa_phone),
+        payoutThreshold: row.payout_threshold || null
+    };
+}
+
+function mapFinanceAuditRow(row) {
+    return {
+        id: row.id,
+        action: row.action,
+        targetType: row.target_type,
+        targetId: row.target_id,
+        reason: row.reason || null,
+        afterState: row.after_state || null,
+        requestId: row.request_id || null,
+        createdAt: row.created_at || null,
+        actorName: row.actor_name || null
+    };
+}
+
+app.get("/api/admin/finance/summary", authenticateToken, requirePermission("finance.read"), async (req, res) => {
+    const range = parseFinanceDateRange(req.query, 30);
+    if (range.error) {
+        return res.status(400).json({ error: range.error });
+    }
+
+    try {
+        const [totals, escrow, credits, exceptions] = await Promise.all([
+            queryFinancePeriodTotals(range.from, range.to),
+            queryFinanceEscrowPosition(),
+            queryFinanceCredits(),
+            queryFinanceExceptionSummary()
+        ]);
+
+        res.json({
+            meta: {
+                currency: FINANCE_CURRENCY,
+                timezone: FINANCE_TIMEZONE_NOTE,
+                from: range.from,
+                to: range.to,
+                days: range.days,
+                generatedAt: new Date().toISOString(),
+                provisional: true,
+                reconciled: false,
+                definitionsVersion: "stage1-legacy-v1",
+                definitions: FINANCE_DEFINITIONS,
+                limitations: FINANCE_KNOWN_LIMITATIONS
+            },
+            metrics: {
+                externalReceipts: {
+                    value: totals.external_receipts,
+                    count: totals.external_receipt_count
+                },
+                platformFees: {
+                    value: totals.platform_fees,
+                    count: totals.platform_fee_count
+                },
+                creatorPayable: {
+                    value: totals.creator_payable,
+                    afterPending: totals.creator_payable_after_pending,
+                    earnings: totals.creator_earnings,
+                    feeDeductions: totals.fee_deductions,
+                    completedPayouts: totals.payouts_settled,
+                    pendingPayouts: totals.payouts_pending
+                },
+                payouts: {
+                    settled: totals.payouts_settled,
+                    pending: totals.payouts_pending,
+                    failed: totals.payouts_failed,
+                    completedCount: totals.completed_payout_count,
+                    pendingCount: totals.pending_payout_count,
+                    failedCount: totals.failed_payout_count,
+                    staleValue: totals.stale_pending_payout_value,
+                    staleCount: totals.stale_pending_payout_count
+                },
+                escrow: {
+                    held: escrow.held,
+                    heldCount: escrow.held_count,
+                    released: escrow.released,
+                    releasedCount: escrow.released_count,
+                    refunded: escrow.refunded,
+                    refundedCount: escrow.refunded_count,
+                    none: escrow.none,
+                    noneCount: escrow.none_count,
+                    other: escrow.other,
+                    otherCount: escrow.other_count
+                },
+                funding: {
+                    escrowDeposits: totals.escrow_deposits,
+                    escrowDepositCount: totals.escrow_deposit_count,
+                    cohostPayments: totals.cohost_payments,
+                    cohostPaymentCount: totals.cohost_payment_count,
+                    walletRefunds: totals.wallet_refunds,
+                    walletRefundCount: totals.wallet_refund_count
+                },
+                credits: {
+                    outstanding: credits.outstanding,
+                    accounts: credits.accounts
+                },
+                exceptions: {
+                    total: exceptions.totalIssues,
+                    items: exceptions.items
+                }
+            },
+            context: {
+                transactionCount: totals.transaction_count,
+                duplicateReferenceCount: totals.duplicate_reference_count
+            }
+        });
+    } catch (error) {
+        console.error("Admin finance summary error:", error);
+        res.status(500).json({ error: "Failed to load finance summary" });
+    }
+});
+
+app.get("/api/admin/finance/reports", authenticateToken, requirePermission("finance.read"), async (req, res) => {
+    const range = parseFinanceDateRange(req.query, 30);
+    if (range.error) {
+        return res.status(400).json({ error: range.error });
+    }
+    const group = req.query.group === "month" ? "month" : "day";
+
+    try {
+        const totals = await queryFinancePeriodTotals(range.from, range.to);
+        const bucketsResult = await pool.query(`
+            WITH period AS (
+                SELECT * FROM transactions
+                WHERE created_at >= $1::date AND created_at < ($2::date + INTERVAL '1 day')
+            )
+            SELECT
+                to_char(date_trunc($3::text, created_at), CASE WHEN $3::text = 'month' THEN 'YYYY-MM' ELSE 'YYYY-MM-DD' END) AS period,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND amount > 0 AND (type IN ('subscription', 'credit_purchase') OR type = 'reactivation_fee') THEN amount ELSE 0 END), 0)::text AS external_receipts,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND type IN ('platform_fee', 'cohost_platform_fee') THEN ABS(amount) ELSE 0 END), 0)::text AS platform_fees,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND type IN ('subscription', 'referral_commission', 'cohost_host_earning', 'cohost_referrer_earning', 'escrow_release') THEN amount ELSE 0 END), 0)::text AS creator_earnings,
+            COALESCE(SUM(CASE WHEN status = 'completed' AND (type IN ('referral_fee', 'platform_fee', 'cohost_platform_fee') OR (type = 'reactivation_fee' AND amount < 0)) THEN amount ELSE 0 END), 0)::text AS fee_deductions,
+                ABS(COALESCE(SUM(CASE WHEN status = 'completed' AND type = 'payout' THEN amount ELSE 0 END), 0))::text AS payouts_settled,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND type = 'escrow_deposit' THEN ABS(amount) ELSE 0 END), 0)::text AS escrow_deposits,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND type = 'cohost_payment' THEN ABS(amount) ELSE 0 END), 0)::text AS cohost_payments,
+                COALESCE(SUM(CASE WHEN status = 'completed' AND type = 'cohost_refund' THEN amount ELSE 0 END), 0)::text AS wallet_refunds,
+                COUNT(*)::int AS transaction_count
+            FROM period
+            GROUP BY 1
+            ORDER BY 1
+        `, [range.from, range.to, group]);
+
+        const byTypeResult = await pool.query(`
+            SELECT type, COUNT(*)::int AS count, COALESCE(SUM(amount), 0)::text AS total
+            FROM transactions
+            WHERE created_at >= $1::date AND created_at < ($2::date + INTERVAL '1 day')
+            GROUP BY type
+            ORDER BY type
+        `, [range.from, range.to]);
+
+        res.json({
+            meta: {
+                currency: FINANCE_CURRENCY,
+                timezone: FINANCE_TIMEZONE_NOTE,
+                from: range.from,
+                to: range.to,
+                days: range.days,
+                group,
+                generatedAt: new Date().toISOString(),
+                provisional: true,
+                reconciled: false,
+                definitions: FINANCE_DEFINITIONS,
+                limitations: FINANCE_KNOWN_LIMITATIONS
+            },
+            totals,
+            buckets: bucketsResult.rows,
+            byType: byTypeResult.rows.map((row) => {
+                const meta = financeTypeMeta(row.type);
+                return { ...row, typeLabel: meta.label, category: meta.category };
+            }),
+            currentPositions: {
+                escrow: await queryFinanceEscrowPosition(),
+                credits: await queryFinanceCredits()
+            }
+        });
+    } catch (error) {
+        console.error("Admin finance reports error:", error);
+        res.status(500).json({ error: "Failed to load finance reports" });
+    }
+});
+
+app.get("/api/admin/finance/transactions", authenticateToken, requirePermission("finance.read"), async (req, res) => {
+    const filters = buildFinanceTransactionFilters(req.query);
+    if (filters.error) {
+        return res.status(400).json({ error: filters.error });
+    }
+
+    try {
+        const rows = await queryFinanceTransactions(filters);
+        const first = rows[0] || {};
+        res.json({
+            items: rows.map(mapFinanceTransaction),
+            pagination: financePagination(first.total_count, filters.limit, filters.offset),
+            totals: {
+                signed: first.total_signed_amount || "0",
+                credit: first.total_credit || "0",
+                debit: first.total_debit || "0"
+            },
+            filters: {
+                from: filters.range.from,
+                to: filters.range.to,
+                q: filters.q,
+                flow: filters.flow,
+                type: filters.type,
+                status: filters.status,
+                direction: filters.direction,
+                issue: filters.issue,
+                issueLabel: filters.issue === "all" ? null : FINANCE_TRANSACTION_ISSUES[filters.issue],
+                userId: filters.userId,
+                minAmount: filters.minAmount,
+                maxAmount: filters.maxAmount
+            },
+            meta: {
+                currency: FINANCE_CURRENCY,
+                timezone: FINANCE_TIMEZONE_NOTE,
+                provisional: true,
+                reconciled: false
+            }
+        });
+    } catch (error) {
+        console.error("Admin finance transactions error:", error);
+        res.status(500).json({ error: "Failed to load finance transactions" });
+    }
+});
+
+app.get("/api/admin/finance/transactions/:id", authenticateToken, requirePermission("finance.read"), async (req, res) => {
+    const id = parseFinanceId(req.params.id);
+    if (!id) {
+        return res.status(400).json({ error: "Invalid transaction ID" });
+    }
+
+    try {
+        const detail = await loadFinanceTransactionDetail(id);
+        if (!detail) {
+            return res.status(404).json({ error: "Transaction not found" });
+        }
+        res.json({
+            ...detail,
+            meta: {
+                currency: FINANCE_CURRENCY,
+                timezone: FINANCE_TIMEZONE_NOTE,
+                provisional: true,
+                reconciled: false
+            }
+        });
+    } catch (error) {
+        console.error("Admin finance transaction detail error:", error);
+        res.status(500).json({ error: "Failed to load transaction detail" });
+    }
+});
+
+app.get("/api/admin/finance/payouts", authenticateToken, requirePermission("finance.read"), async (req, res) => {
+    const filters = buildFinancePayoutFilters(req.query);
+    if (filters.error) {
+        return res.status(400).json({ error: filters.error });
+    }
+
+    try {
+        const [rows, totals] = await Promise.all([
+            queryFinancePayouts(filters),
+            queryFinancePeriodTotals(filters.range.from, filters.range.to)
+        ]);
+        const first = rows[0] || {};
+        res.json({
+            items: rows.map(mapFinancePayout),
+            pagination: financePagination(first.total_count, filters.limit, filters.offset),
+            totals: {
+                settled: totals.payouts_settled,
+                pending: totals.payouts_pending,
+                failed: totals.payouts_failed,
+                completedCount: totals.completed_payout_count,
+                pendingCount: totals.pending_payout_count,
+                failedCount: totals.failed_payout_count,
+                staleValue: totals.stale_pending_payout_value,
+                staleCount: totals.stale_pending_payout_count
+            },
+            filters: {
+                from: filters.range.from,
+                to: filters.range.to,
+                q: filters.q,
+                status: filters.status,
+                issue: filters.issue,
+                issueLabel: filters.issue === "all" ? null : FINANCE_TRANSACTION_ISSUES[filters.issue]
+            },
+            meta: {
+                currency: FINANCE_CURRENCY,
+                timezone: FINANCE_TIMEZONE_NOTE,
+                provisional: true,
+                reconciled: false,
+                historicalMethodAvailable: false,
+                methodNote: "Current payout settings are shown because historical payout methods are not stored on transaction rows."
+            }
+        });
+    } catch (error) {
+        console.error("Admin finance payouts error:", error);
+        res.status(500).json({ error: "Failed to load payouts" });
+    }
+});
+
+app.get("/api/admin/finance/payouts/:id", authenticateToken, requirePermission("finance.read"), async (req, res) => {
+    const id = parseFinanceId(req.params.id);
+    if (!id) {
+        return res.status(400).json({ error: "Invalid payout ID" });
+    }
+
+    try {
+        const detail = await loadFinanceTransactionDetail(id);
+        if (!detail || detail.transaction.type !== "payout") {
+            return res.status(404).json({ error: "Payout not found" });
+        }
+        res.json({
+            ...detail,
+            meta: {
+                currency: FINANCE_CURRENCY,
+                timezone: FINANCE_TIMEZONE_NOTE,
+                provisional: true,
+                reconciled: false,
+                historicalMethodAvailable: false
+            }
+        });
+    } catch (error) {
+        console.error("Admin finance payout detail error:", error);
+        res.status(500).json({ error: "Failed to load payout detail" });
+    }
+});
+
+app.get("/api/admin/finance/escrows", authenticateToken, requirePermission("finance.read"), async (req, res) => {
+    const filters = buildFinanceEscrowFilters(req.query);
+    if (filters.error) {
+        return res.status(400).json({ error: filters.error });
+    }
+
+    try {
+        const [rows, position] = await Promise.all([
+            queryFinanceEscrows(filters),
+            queryFinanceEscrowPosition()
+        ]);
+        const first = rows[0] || {};
+        res.json({
+            items: rows.map(mapFinanceEscrow),
+            pagination: financePagination(first.total_count, filters.limit, filters.offset),
+            position,
+            filters: {
+                from: filters.range.from,
+                to: filters.range.to,
+                q: filters.q,
+                escrowStatus: filters.escrowStatus,
+                campaignStatus: filters.campaignStatus,
+                issue: filters.issue,
+                issueLabel: filters.issue === "all" ? null : FINANCE_ESCROW_ISSUES[filters.issue]
+            },
+            meta: {
+                currency: FINANCE_CURRENCY,
+                timezone: FINANCE_TIMEZONE_NOTE,
+                provisional: true,
+                reconciled: false,
+                depositLinkMethod: "Escrow transactions are linked by the campaign ID embedded in their legacy description.",
+                limitations: FINANCE_KNOWN_LIMITATIONS
+            }
+        });
+    } catch (error) {
+        console.error("Admin finance escrows error:", error);
+        res.status(500).json({ error: "Failed to load escrows" });
+    }
+});
+
+app.get("/api/admin/finance/escrows/:id", authenticateToken, requirePermission("finance.read"), async (req, res) => {
+    const id = parseFinanceId(req.params.id);
+    if (!id) {
+        return res.status(400).json({ error: "Invalid escrow ID" });
+    }
+
+    try {
+        const rows = await queryFinanceEscrows({
+            whereSql: "WHERE c.id = $1",
+            params: [id],
+            orderSql: "ORDER BY c.id DESC",
+            limit: 1,
+            offset: 0
+        });
+        if (rows.length === 0) {
+            return res.status(404).json({ error: "Escrow campaign not found" });
+        }
+        const related = await pool.query(`
+            SELECT t.id, t.creator_id, t.type, t.amount::text AS amount, t.status, t.transaction_id,
+                   t.description, to_char(t.created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at,
+                   u.name AS user_name
+            FROM transactions t
+            LEFT JOIN users u ON u.id = t.creator_id
+            WHERE (t.type = 'escrow_deposit' AND t.description LIKE 'Escrow deposit for campaign #' || $1 || ':%')
+               OR (t.type = 'escrow_release' AND t.description LIKE 'Campaign sponsorship payout for #' || $1 || '%')
+            ORDER BY t.created_at DESC, t.id DESC
+        `, [id]);
+        res.json({
+            escrow: mapFinanceEscrow(rows[0]),
+            relatedTransactions: related.rows.map(mapFinanceTransaction),
+            meta: {
+                currency: FINANCE_CURRENCY,
+                timezone: FINANCE_TIMEZONE_NOTE,
+                provisional: true,
+                reconciled: false,
+                limitations: FINANCE_KNOWN_LIMITATIONS
+            }
+        });
+    } catch (error) {
+        console.error("Admin finance escrow detail error:", error);
+        res.status(500).json({ error: "Failed to load escrow detail" });
+    }
+});
+
+app.get("/api/admin/finance/reconciliation", authenticateToken, requirePermission("finance.read"), async (req, res) => {
+    try {
+        const summary = await queryFinanceExceptionSummary();
+        res.json({
+            ...summary,
+            meta: {
+                currency: FINANCE_CURRENCY,
+                timezone: FINANCE_TIMEZONE_NOTE,
+                provisional: true,
+                reconciled: false,
+                scope: "All-time internal exceptions. Provider settlement import and matching are not available in Stage 1.",
+                knownCodeIssue: "Deployed campaign constraints reject pending_deposit and deposit_failed, while current campaign code writes those values."
+            }
+        });
+    } catch (error) {
+        console.error("Admin finance reconciliation error:", error);
+        res.status(500).json({ error: "Failed to load reconciliation exceptions" });
+    }
+});
+
+app.get("/api/admin/finance/audit", authenticateToken, requirePermission("finance.read"), async (req, res) => {
+    const limit = parseBoundedInt(req.query.limit, 20, 1, 100);
+    const offset = parseBoundedInt(req.query.offset, 0, 0, 1000000);
+    if (limit === null) return res.status(400).json({ error: "Limit must be between 1 and 100" });
+    if (offset === null) return res.status(400).json({ error: "Offset is invalid" });
+
+    try {
+        const rows = await queryFinanceAudit(limit, offset);
+        res.json({
+            items: rows.map(mapFinanceAuditRow),
+            pagination: financePagination(rows[0]?.total_count, limit, offset)
+        });
+    } catch (error) {
+        console.error("Admin finance audit error:", error);
+        res.status(500).json({ error: "Failed to load finance audit events" });
+    }
+});
+
+app.get("/api/admin/finance/exports", authenticateToken, requirePermission("finance.export"), async (req, res) => {
+    if (!req.staff.permissions.includes("finance.read")) {
+        return res.status(403).json({
+            error: "Finance read access is required to export finance data",
+            code: "PERMISSION_DENIED",
+            permission: "finance.read"
+        });
+    }
+    const dataset = typeof req.query.dataset === "string" ? req.query.dataset : "";
+    if (!["transactions", "payouts", "escrows", "summary"].includes(dataset)) {
+        return res.status(400).json({ error: "Invalid export dataset" });
+    }
+
+    try {
+        let rows = [];
+        let headers = [];
+        let numericColumns = [];
+        let filename = `finance-${dataset}-${financeToday()}.csv`;
+        let auditState = { dataset };
+
+        if (dataset === "transactions") {
+            const filters = buildFinanceTransactionFilters({ ...req.query, limit: "100", offset: "0" });
+            if (filters.error) return res.status(400).json({ error: filters.error });
+            filters.limit = 10001;
+            const data = await queryFinanceTransactions(filters);
+            if (data.length > 10000) {
+                return res.status(400).json({ error: "Export is too large. Narrow the filters or date range." });
+            }
+            rows = data.map((row) => {
+                const transaction = mapFinanceTransaction(row);
+                return [
+                    transaction.createdAt,
+                    transaction.id,
+                    transaction.typeLabel,
+                    transaction.direction,
+                    transaction.amount,
+                    transaction.status,
+                    transaction.reference || "",
+                    transaction.userId || "",
+                    transaction.userName || "",
+                    transaction.description || "",
+                    transaction.related.kind || "",
+                    transaction.related.id || ""
+                ];
+            });
+            headers = ["Created", "Transaction ID", "Type", "Direction", "Amount (KES)", "Status", "Reference", "Account ID", "Account", "Description", "Related type", "Related ID"];
+            numericColumns = [4];
+            filename = `finance-transactions-${filters.range.from}-to-${filters.range.to}.csv`;
+            auditState = { dataset, from: filters.range.from, to: filters.range.to, flow: filters.flow, type: filters.type, status: filters.status, issue: filters.issue, q: filters.q, rowCount: rows.length };
+        } else if (dataset === "payouts") {
+            const filters = buildFinancePayoutFilters({ ...req.query, limit: "100", offset: "0" });
+            if (filters.error) return res.status(400).json({ error: filters.error });
+            filters.limit = 10001;
+            const data = await queryFinancePayouts(filters);
+            if (data.length > 10000) {
+                return res.status(400).json({ error: "Export is too large. Narrow the filters or date range." });
+            }
+            rows = data.map((row) => {
+                const payout = mapFinancePayout(row);
+                return [
+                    payout.createdAt,
+                    payout.id,
+                    payout.creator.id,
+                    payout.creator.name || "",
+                    payout.amount,
+                    payout.status,
+                    payout.reference || "",
+                    payout.currentMethod || "",
+                    payout.maskedDestination || "",
+                    payout.ageHours === null ? "" : payout.ageHours.toFixed(2),
+                    payout.description || ""
+                ];
+            });
+            headers = ["Created", "Payout ID", "Creator ID", "Creator", "Amount (KES)", "Status", "Reference", "Current method", "Destination", "Age hours", "Description"];
+            numericColumns = [4, 9];
+            filename = `finance-payouts-${filters.range.from}-to-${filters.range.to}.csv`;
+            auditState = { dataset, from: filters.range.from, to: filters.range.to, status: filters.status, issue: filters.issue, q: filters.q, rowCount: rows.length };
+        } else if (dataset === "escrows") {
+            const filters = buildFinanceEscrowFilters({ ...req.query, limit: "100", offset: "0" });
+            if (filters.error) return res.status(400).json({ error: filters.error });
+            filters.limit = 10001;
+            const data = await queryFinanceEscrows(filters);
+            if (data.length > 10000) {
+                return res.status(400).json({ error: "Export is too large. Narrow the filters or date range." });
+            }
+            rows = data.map((row) => {
+                const escrow = mapFinanceEscrow(row);
+                return [
+                    escrow.createdAt,
+                    escrow.id,
+                    escrow.title,
+                    escrow.businessName || "",
+                    escrow.budget || "0",
+                    escrow.escrowAmount,
+                    escrow.escrowStatus,
+                    escrow.campaignStatus,
+                    escrow.paymentMethod || "",
+                    escrow.reference || "",
+                    escrow.creatorName || "",
+                    escrow.depositCount,
+                    escrow.depositAmount,
+                    escrow.releaseCount,
+                    escrow.releaseAmount,
+                    escrow.flags.map((flag) => flag.code).join("|")
+                ];
+            });
+            headers = ["Created", "Campaign ID", "Title", "Business", "Budget", "Escrow amount", "Escrow status", "Campaign status", "Payment method", "Reference", "Selected creator", "Deposit count", "Deposit total", "Release count", "Release total", "Flags"];
+            numericColumns = [4, 5, 12, 14];
+            filename = `finance-escrows-${filters.range.from}-to-${filters.range.to}.csv`;
+            auditState = { dataset, from: filters.range.from, to: filters.range.to, escrowStatus: filters.escrowStatus, campaignStatus: filters.campaignStatus, issue: filters.issue, q: filters.q, rowCount: rows.length };
+        } else {
+            const filters = buildFinanceTransactionFilters({ ...req.query, limit: "100", offset: "0" });
+            if (filters.error) return res.status(400).json({ error: filters.error });
+            const totals = await queryFinancePeriodTotals(filters.range.from, filters.range.to);
+            rows = [
+                ["External receipts", totals.external_receipts],
+                ["Platform fees recorded", totals.platform_fees],
+                ["Creator earnings", totals.creator_earnings],
+                ["Fee deductions", totals.fee_deductions],
+                ["Creator payable estimate", totals.creator_payable],
+                ["Creator payable after pending payouts", totals.creator_payable_after_pending],
+                ["Payouts settled", totals.payouts_settled],
+                ["Payouts pending", totals.payouts_pending],
+                ["Payouts failed", totals.payouts_failed],
+                ["Escrow deposits (funding source unverified)", totals.escrow_deposits],
+                ["Co-host payments (funding source unverified)", totals.cohost_payments],
+                ["Wallet refunds", totals.wallet_refunds],
+                ["Stale pending value", totals.stale_pending_value],
+                ["Transactions", totals.transaction_count]
+            ];
+            headers = ["Metric", "Value"];
+            numericColumns = [1];
+            filename = `finance-summary-${filters.range.from}-to-${filters.range.to}.csv`;
+            auditState = { dataset, from: filters.range.from, to: filters.range.to, rowCount: rows.length };
+        }
+
+        await writeFinanceAudit(
+            req,
+            "finance.export",
+            "finance_export",
+            null,
+            `Exported ${dataset} finance data for ${auditState.from || "current"} to ${auditState.to || "current"}`,
+            auditState
+        );
+        sendFinanceCsv(res, filename, headers, rows, numericColumns);
+    } catch (error) {
+        console.error("Admin finance export error:", error);
+        res.status(500).json({ error: "Failed to export finance data" });
+    }
+});
+
 // ========== CRON JOBS (REQ-09, REQ-14, REQ-15) ==========
 
 // Daily at midnight EAT (UTC+3 = 21:00 UTC): recalculate active/dormant status
@@ -5780,15 +8732,15 @@ async function checkCohostEligibility(creatorId) {
     };
 }
 
-// ---- Helper: Process co-hosting revenue split (70% Host / 15% Referrer / 15% Platform) ----
-async function processCohostRevenueSplit(requestId, hostId, totalAmount, transactionId) {
-    const hostAmount = Math.floor(totalAmount * 0.70);
+// ---- Helper: Process co-hosting revenue split (65% Host / 15% Referrer / remainder Platform) ----
+async function processCohostRevenueSplit(requestId, hostId, totalAmount, transactionId, db = pool) {
+    const hostAmount = Math.floor(totalAmount * 0.65);
     let referrerAmount = 0;
-    let platformAmount = Math.floor(totalAmount * 0.15);
+    let platformAmount = 0;
     let referrerId = null;
 
     // Find if host was referred
-    const hostResult = await pool.query(
+    const hostResult = await db.query(
         `SELECT referred_by FROM users WHERE id = $1`, [hostId]
     );
     referrerId = hostResult.rows[0]?.referred_by || null;
@@ -5797,19 +8749,12 @@ async function processCohostRevenueSplit(requestId, hostId, totalAmount, transac
         const referrerActive = await isCreatorActive(referrerId);
         if (referrerActive) {
             referrerAmount = Math.floor(totalAmount * 0.15);
-            platformAmount = totalAmount - hostAmount - referrerAmount; // remainder to platform
-        } else {
-            // Dormant referrer — platform gets the referrer share
-            referrerAmount = 0;
-            platformAmount = totalAmount - hostAmount;
         }
-    } else {
-        // No referrer — platform gets 30% (host share stays 70%)
-        platformAmount = totalAmount - hostAmount;
     }
+    platformAmount = totalAmount - hostAmount - referrerAmount;
 
     // Record host earning
-    await pool.query(
+    await db.query(
         `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
          VALUES ($1, 'cohost_host_earning', $2, 'completed', $3, $4)`,
         [hostId, hostAmount, `CH-${transactionId}`, `Co-host earning from request #${requestId}`]
@@ -5817,7 +8762,7 @@ async function processCohostRevenueSplit(requestId, hostId, totalAmount, transac
 
     // Record referrer earning if applicable
     if (referrerId && referrerAmount > 0) {
-        await pool.query(
+        await db.query(
             `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
              VALUES ($1, 'cohost_referrer_earning', $2, 'completed', $3, $4)`,
             [referrerId, referrerAmount, `CHR-${transactionId}`, `Co-host referral earning from host #${hostId}`]
@@ -5826,7 +8771,7 @@ async function processCohostRevenueSplit(requestId, hostId, totalAmount, transac
 
     // Record platform fee
     if (platformAmount > 0) {
-        await pool.query(
+        await db.query(
             `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
              VALUES ($1, 'cohost_platform_fee', $2, 'completed', $3, $4)`,
             [hostId, -platformAmount, `CHPF-${transactionId}`, `Platform fee for co-host request #${requestId}`]
@@ -5834,7 +8779,7 @@ async function processCohostRevenueSplit(requestId, hostId, totalAmount, transac
     }
 
     // Update host's last_sale_at
-    await pool.query(
+    await db.query(
         `UPDATE users SET last_sale_at = NOW(), is_active_creator = TRUE WHERE id = $1`,
         [hostId]
     );
@@ -5842,8 +8787,140 @@ async function processCohostRevenueSplit(requestId, hostId, totalAmount, transac
     return { hostAmount, referrerAmount, platformAmount };
 }
 
+async function publishCohostRequest(request, db = pool) {
+    const publication = await db.query(
+        `UPDATE cohost_requests
+         SET status = 'published', payment_status = 'completed', reviewed_at = NOW()
+         WHERE id = $1 AND status = 'pending_approval' AND payment_status = 'held'
+           AND expires_at > NOW()
+         RETURNING *`,
+        [request.id]
+    );
+    if (publication.rowCount === 0) {
+        throw new Error("Co-post request is no longer eligible for approval");
+    }
+
+    const postResult = await db.query(
+        `INSERT INTO posts (user_id, type, title, caption, tags, images, video_url, audio_url,
+                            is_copost, cohost_request_id, cohost_host_id, status, is_draft, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9, $10, 'approved', FALSE, NOW() + INTERVAL '30 days')
+         RETURNING id`,
+        [request.guest_id, request.post_type || 'text', request.post_title, request.post_caption,
+            request.post_tags || '{}', JSON.stringify(request.post_images || []),
+            request.post_video_url, request.post_audio_url, request.id, request.host_id]
+    );
+
+    const paymentReference = request.payment_reference || `CH-${request.id}`;
+    await processCohostRevenueSplit(request.id, request.host_id, request.price, paymentReference, db);
+    return postResult.rows[0].id;
+}
+
+async function refundCohostRequest(requestId) {
+    const client = await pool.connect();
+    let transactionStarted = false;
+    try {
+        await client.query("BEGIN");
+        transactionStarted = true;
+        const locked = await client.query(
+            `SELECT * FROM cohost_requests
+             WHERE id = $1 AND status IN ('rejected', 'expired') AND payment_status = 'held'
+             FOR UPDATE`,
+            [requestId]
+        );
+        if (locked.rowCount === 0) {
+            await client.query("COMMIT");
+            transactionStarted = false;
+            return { status: "not_required" };
+        }
+
+        const request = locked.rows[0];
+        if (request.payment_method === "wallet") {
+            await client.query(
+                "UPDATE users SET credits = credits + $1 WHERE id = $2",
+                [request.price, request.guest_id]
+            );
+            await client.query(
+                `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+                 VALUES ($1, 'cohost_refund', $2, 'completed', $3, $4)`,
+                [request.guest_id, request.price, `CHREF-${request.id}`, `Refund for co-post request #${request.id}`]
+            );
+            await client.query(
+                "UPDATE cohost_requests SET payment_status = 'refunded' WHERE id = $1",
+                [request.id]
+            );
+            await client.query("COMMIT");
+            transactionStarted = false;
+            return { status: "refunded" };
+        }
+
+        if (request.payment_method !== "mpesa" || !/^254[71]\d{8}$/.test(request.mpesa_phone || "")) {
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+            throw new Error(`Cannot initiate M-Pesa refund for co-post request #${request.id}: payer phone is unavailable`);
+        }
+
+        const refundReference = `CHREF-${request.id}-${Date.now()}`;
+        const refundResult = await client.query(
+            `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
+             VALUES ($1, 'cohost_refund', $2, 'pending', $3, $4)
+             RETURNING id`,
+            [request.guest_id, request.price, refundReference, `CoHost refund request #${request.id}`]
+        );
+        await client.query(
+            "UPDATE cohost_requests SET payment_status = 'refunding' WHERE id = $1",
+            [request.id]
+        );
+        await client.query("COMMIT");
+        transactionStarted = false;
+
+        try {
+            const accessToken = await getAccessToken();
+            const endpoint = process.env.MPESA_ENV === "sandbox"
+                ? "https://sandbox.safaricom.co.ke/mpesa/b2c/v1/paymentrequest"
+                : "https://api.safaricom.co.ke/mpesa/b2c/v1/paymentrequest";
+            const response = await axios.post(endpoint, {
+                InitiatorName: process.env.MPESA_INITIATOR_NAME,
+                SecurityCredential: env.SECURITY_CREDENTIAL,
+                CommandID: "BusinessPayment",
+                Amount: request.price,
+                PartyA: process.env.PAYBILL_NUMBER,
+                PartyB: request.mpesa_phone,
+                Remarks: `Co-host refund for request ${request.id}`,
+                QueueTimeOutURL: process.env.MPESA_B2C_TIMEOUT_URL,
+                ResultURL: process.env.MPESA_B2C_CALLBACK_URL,
+                Occasion: `CH-${request.id}`
+            }, {
+                headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" }
+            });
+            if (response.data.ResponseCode !== "0" || !response.data.OriginatorConversationID) {
+                throw new Error(response.data.ResponseDescription || "M-Pesa did not accept the refund request");
+            }
+            await pool.query(
+                "UPDATE transactions SET transaction_id = $1 WHERE id = $2 AND status = 'pending'",
+                [response.data.OriginatorConversationID, refundResult.rows[0].id]
+            );
+            return { status: "refunding" };
+        } catch (error) {
+            await pool.query(
+                "UPDATE transactions SET status = 'failed', description = $1 WHERE id = $2 AND status = 'pending'",
+                [`CoHost refund initiation failed: ${error.message}`, refundResult.rows[0].id]
+            );
+            await pool.query(
+                "UPDATE cohost_requests SET payment_status = 'held' WHERE id = $1 AND payment_status = 'refunding'",
+                [request.id]
+            );
+            throw error;
+        }
+    } catch (error) {
+        if (transactionStarted) await client.query("ROLLBACK").catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 // GET /api/cohost/eligibility — Check if current user meets hosting requirements
-app.get("/api/cohost/eligibility", authenticateToken, async (req, res) => {
+app.get("/api/cohost/eligibility", authenticateToken, requireAccountType("creator"), async (req, res) => {
     try {
         const eligibility = await checkCohostEligibility(req.user.id);
         res.json(eligibility);
@@ -5867,7 +8944,7 @@ app.get("/api/cohost/settings/:creatorId", async (req, res) => {
         );
 
         if (result.rowCount === 0) {
-            return res.json({ enabled: false, price: 299, max_daily_posts: 10, creator_id: parseInt(creatorId) });
+            return res.json({ enabled: false, price: 100, max_daily_posts: 5, creator_id: parseInt(creatorId) });
         }
 
         res.json(result.rows[0]);
@@ -5878,7 +8955,7 @@ app.get("/api/cohost/settings/:creatorId", async (req, res) => {
 });
 
 // PUT /api/cohost/settings — Enable/disable co-hosting, set price
-app.put("/api/cohost/settings", authenticateToken, async (req, res) => {
+app.put("/api/cohost/settings", authenticateToken, requireAccountType("creator"), async (req, res) => {
     try {
         const creatorId = req.user.id;
         const { enabled, price, max_daily_posts, description } = req.body;
@@ -5903,20 +8980,18 @@ app.put("/api/cohost/settings", authenticateToken, async (req, res) => {
         }
 
         // Validate price
-        const parsedPrice = parseInt(price) || 299;
-        if (parsedPrice < 299) {
-            return res.status(400).json({ error: "Minimum co-hosting price is Kes. 299" });
+        const parsedPrice = Number.parseInt(price, 10);
+        if (!Number.isInteger(parsedPrice) || parsedPrice < 100) {
+            return res.status(400).json({ error: "Minimum co-hosting price is Kes. 100" });
         }
-
-        const parsedMaxDaily = Math.min(Math.max(parseInt(max_daily_posts) || 10, 1), 10);
 
         const result = await pool.query(
             `INSERT INTO cohost_settings (creator_id, enabled, price, max_daily_posts, description, updated_at)
-             VALUES ($1, $2, $3, $4, $5, NOW())
+             VALUES ($1, $2, $3, 5, $4, NOW())
              ON CONFLICT (creator_id) DO UPDATE SET
-                enabled = $2, price = $3, max_daily_posts = $4, description = $5, updated_at = NOW()
+                enabled = $2, price = $3, max_daily_posts = 5, description = $4, updated_at = NOW()
              RETURNING *`,
-            [creatorId, !!enabled, parsedPrice, parsedMaxDaily, description || null]
+            [creatorId, !!enabled, parsedPrice, description || null]
         );
 
         res.json({ message: "Co-host settings updated", settings: result.rows[0] });
@@ -5927,11 +9002,11 @@ app.put("/api/cohost/settings", authenticateToken, async (req, res) => {
 });
 
 // POST /api/cohost/request — Guest submits a co-post request
-app.post("/api/cohost/request", authenticateToken, uploadLimiter, upload.fields([
+app.post("/api/cohost/request", authenticateToken, requireAccountType("creator", "business"), uploadLimiter, upload.fields([
     { name: 'images', maxCount: 10 },
     { name: 'video', maxCount: 1 },
     { name: 'audio', maxCount: 1 }
-]), async (req, res) => {
+]), requireAccountType("creator", "business"), async (req, res) => {
     try {
         const guestId = req.user.id;
         const { host_id, title, caption, type, tags } = req.body;
@@ -5945,7 +9020,9 @@ app.post("/api/cohost/request", authenticateToken, uploadLimiter, upload.fields(
 
         // Check host has co-hosting enabled
         const hostSettings = await pool.query(
-            `SELECT * FROM cohost_settings WHERE creator_id = $1 AND enabled = TRUE`,
+            `SELECT cs.* FROM cohost_settings cs
+             JOIN users u ON u.id = cs.creator_id AND u.account_type = 'creator'
+             WHERE cs.creator_id = $1 AND cs.enabled = TRUE`,
             [host_id]
         );
         if (hostSettings.rowCount === 0) {
@@ -5954,19 +9031,12 @@ app.post("/api/cohost/request", authenticateToken, uploadLimiter, upload.fields(
 
         const settings = hostSettings.rows[0];
 
-        // Check daily limit for the host
-        const dailyCount = await pool.query(
-            `SELECT COUNT(*) as count FROM cohost_requests
-             WHERE host_id = $1 AND status IN ('approved', 'published') AND reviewed_at::date = CURRENT_DATE`,
-            [host_id]
-        );
-        if (parseInt(dailyCount.rows[0].count) >= settings.max_daily_posts) {
-            return res.status(400).json({ error: "This creator has reached their daily co-post limit" });
-        }
-
         // Check for existing pending request from same guest to same host
         const existingRequest = await pool.query(
-            `SELECT id FROM cohost_requests WHERE guest_id = $1 AND host_id = $2 AND status = 'pending'`,
+            `SELECT id FROM cohost_requests
+             WHERE guest_id = $1 AND host_id = $2
+               AND status IN ('pending', 'pending_approval')
+               AND payment_status IN ('pending', 'held')`,
             [guestId, host_id]
         );
         if (existingRequest.rowCount > 0) {
@@ -5984,10 +9054,9 @@ app.post("/api/cohost/request", authenticateToken, uploadLimiter, upload.fields(
                 const { error: uploadError } = await supabase.storage
                     .from('uploads')
                     .upload(fileName, file.buffer, { contentType: file.mimetype });
-                if (!uploadError) {
-                    const { data: urlData } = supabase.storage.from('uploads').getPublicUrl(fileName);
-                    imageUrls.push({ url: urlData.publicUrl, caption: '' });
-                }
+                if (uploadError) throw uploadError;
+                const { data: urlData } = supabase.storage.from('uploads').getPublicUrl(fileName);
+                imageUrls.push({ url: urlData.publicUrl, caption: '' });
             }
         }
 
@@ -5997,10 +9066,9 @@ app.post("/api/cohost/request", authenticateToken, uploadLimiter, upload.fields(
             const { error: uploadError } = await supabase.storage
                 .from('uploads')
                 .upload(fileName, file.buffer, { contentType: file.mimetype });
-            if (!uploadError) {
-                const { data: urlData } = supabase.storage.from('uploads').getPublicUrl(fileName);
-                videoUrl = urlData.publicUrl;
-            }
+            if (uploadError) throw uploadError;
+            const { data: urlData } = supabase.storage.from('uploads').getPublicUrl(fileName);
+            videoUrl = urlData.publicUrl;
         }
 
         if (req.files?.audio?.[0]) {
@@ -6009,38 +9077,24 @@ app.post("/api/cohost/request", authenticateToken, uploadLimiter, upload.fields(
             const { error: uploadError } = await supabase.storage
                 .from('uploads')
                 .upload(fileName, file.buffer, { contentType: file.mimetype });
-            if (!uploadError) {
-                const { data: urlData } = supabase.storage.from('uploads').getPublicUrl(fileName);
-                audioUrl = urlData.publicUrl;
-            }
+            if (uploadError) throw uploadError;
+            const { data: urlData } = supabase.storage.from('uploads').getPublicUrl(fileName);
+            audioUrl = urlData.publicUrl;
         }
 
         const parsedTags = tags ? (Array.isArray(tags) ? tags : JSON.parse(tags)) : [];
 
         // Create the co-host request
         const result = await pool.query(
-            `INSERT INTO cohost_requests (guest_id, host_id, price, post_title, post_caption, post_type, post_images, post_video_url, post_audio_url, post_tags)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            `INSERT INTO cohost_requests (guest_id, host_id, price, status, expires_at, post_title, post_caption, post_type, post_images, post_video_url, post_audio_url, post_tags)
+             VALUES ($1, $2, $3, 'pending', NULL, $4, $5, $6, $7, $8, $9, $10)
              RETURNING *`,
             [guestId, host_id, settings.price, title || null, caption || null, type || 'text',
              JSON.stringify(imageUrls), videoUrl, audioUrl, parsedTags]
         );
 
-        // Get guest name for notification
-        const guestInfo = await pool.query(`SELECT name FROM users WHERE id = $1`, [guestId]);
-        const guestName = guestInfo.rows[0]?.name || 'A creator';
-
-        // Notify host
-        await createNotification(
-            parseInt(host_id),
-            'cohost_request_received',
-            'New Co-Post Request',
-            `${guestName} wants to co-post on your profile for Kes. ${settings.price}`,
-            { requestId: result.rows[0].id, guestId, guestName }
-        );
-
         res.status(201).json({
-            message: "Co-post request submitted successfully",
+            message: "Draft submitted. Complete payment to send it to the host for review.",
             request: result.rows[0]
         });
     } catch (error) {
@@ -6050,10 +9104,10 @@ app.post("/api/cohost/request", authenticateToken, uploadLimiter, upload.fields(
 });
 
 // GET /api/cohost/requests/incoming — Host views pending co-post requests
-app.get("/api/cohost/requests/incoming", authenticateToken, async (req, res) => {
+app.get("/api/cohost/requests/incoming", authenticateToken, requireAccountType("creator"), async (req, res) => {
     try {
         const hostId = req.user.id;
-        const { status = 'all', limit = 20, offset = 0 } = req.query;
+        const { status = 'pending_approval', limit = 20, offset = 0 } = req.query;
 
         let query = `
             SELECT cr.*, u.name as guest_name, cp.profile_image as guest_avatar, u.badge_level as guest_badge_level
@@ -6167,125 +9221,124 @@ app.get("/api/cohost/requests/:id", authenticateToken, async (req, res) => {
 });
 
 // PUT /api/cohost/requests/:id/approve — Host approves a request
-app.put("/api/cohost/requests/:id/approve", authenticateToken, async (req, res) => {
+app.put("/api/cohost/requests/:id/approve", authenticateToken, requireAccountType("creator"), async (req, res) => {
+    let client;
+    let transactionStarted = false;
     try {
         const { id } = req.params;
         const hostId = req.user.id;
+        client = await pool.connect();
+        await client.query("BEGIN");
+        transactionStarted = true;
 
-        // Verify this request belongs to the host and is pending
-        const requestResult = await pool.query(
-            `SELECT cr.*, cs.max_daily_posts
-             FROM cohost_requests cr
-             JOIN cohost_settings cs ON cr.host_id = cs.creator_id
-             WHERE cr.id = $1 AND cr.host_id = $2 AND cr.status = 'pending'`,
+        await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [hostId]);
+        const requestResult = await client.query(
+            `SELECT * FROM cohost_requests
+             WHERE id = $1 AND host_id = $2 AND status = 'pending_approval'
+               AND payment_status = 'held' AND expires_at > NOW()
+             FOR UPDATE`,
             [id, hostId]
         );
-
         if (requestResult.rowCount === 0) {
-            return res.status(404).json({ error: "Pending co-post request not found" });
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+            return res.status(404).json({ error: "Paid co-post request is not pending approval" });
         }
-
         const request = requestResult.rows[0];
-
-        // Check daily limit
-        const dailyCount = await pool.query(
-            `SELECT COUNT(*) as count FROM cohost_requests
-             WHERE host_id = $1 AND status IN ('approved', 'published') AND reviewed_at::date = CURRENT_DATE`,
+        const accepted = await client.query(
+            `SELECT COUNT(*)::int AS count FROM cohost_requests
+             WHERE host_id = $1 AND status = 'published'
+               AND reviewed_at >= NOW() - INTERVAL '24 hours'`,
             [hostId]
         );
-        if (parseInt(dailyCount.rows[0].count) >= request.max_daily_posts) {
-            return res.status(400).json({ error: "You have reached your daily co-post approval limit" });
+        if (accepted.rows[0].count >= 5) {
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+            return res.status(409).json({ error: "The host has reached the maximum of five accepted co-posts in a rolling 24-hour period" });
         }
 
-        // Update request status to approved (payment will be triggered separately)
-        await pool.query(
-            `UPDATE cohost_requests SET status = 'approved', reviewed_at = NOW() WHERE id = $1`,
-            [id]
-        );
-
-        // Get host name for notification
-        const hostInfo = await pool.query(`SELECT name FROM users WHERE id = $1`, [hostId]);
-        const hostName = hostInfo.rows[0]?.name || 'The creator';
-
-        // Notify guest that request was approved — they now need to pay
+        const postId = await publishCohostRequest(request, client);
+        await client.query("COMMIT");
+        transactionStarted = false;
         await createNotification(
             request.guest_id,
-            'cohost_request_approved',
-            'Co-Post Request Approved!',
-            `${hostName} approved your co-post request. Complete payment of Kes. ${request.price} to publish.`,
-            { requestId: parseInt(id), hostId, hostName, price: request.price }
+            "cohost_post_published",
+            "Your Co-Post is Live!",
+            "The host approved your paid co-post. It is now visible on both profiles and feeds.",
+            { requestId: Number(id), hostId, postId }
         );
-
-        res.json({ message: "Co-post request approved. Waiting for guest payment." });
+        await createNotification(
+            hostId,
+            "cohost_post_published",
+            "Co-Post Published",
+            "The paid co-post is now live on your profile.",
+            { requestId: Number(id), guestId: request.guest_id, postId }
+        );
+        res.json({ message: "Co-post approved and published", postId });
     } catch (error) {
+        if (transactionStarted && client) await client.query("ROLLBACK").catch(() => {});
         console.error("Approve cohost request error:", error);
         res.status(500).json({ error: "Failed to approve co-post request" });
+    } finally {
+        if (client) client.release();
     }
 });
 
 // PUT /api/cohost/requests/:id/reject — Host rejects a request
-app.put("/api/cohost/requests/:id/reject", authenticateToken, async (req, res) => {
+app.put("/api/cohost/requests/:id/reject", authenticateToken, requireAccountType("creator"), async (req, res) => {
+    let client;
+    let transactionStarted = false;
     try {
         const { id } = req.params;
         const hostId = req.user.id;
-
-        const requestResult = await pool.query(
-            `SELECT * FROM cohost_requests WHERE id = $1 AND host_id = $2 AND status = 'pending'`,
+        client = await pool.connect();
+        await client.query("BEGIN");
+        transactionStarted = true;
+        const requestResult = await client.query(
+            `UPDATE cohost_requests
+             SET status = 'rejected', reviewed_at = NOW()
+             WHERE id = $1 AND host_id = $2 AND status = 'pending_approval'
+               AND payment_status = 'held' AND expires_at > NOW()
+             RETURNING *`,
             [id, hostId]
         );
-
         if (requestResult.rowCount === 0) {
-            return res.status(404).json({ error: "Pending co-post request not found" });
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+            return res.status(404).json({ error: "Paid co-post request is not pending approval" });
         }
-
         const request = requestResult.rows[0];
+        await client.query("COMMIT");
+        transactionStarted = false;
+        client.release();
+        client = null;
 
-        await pool.query("BEGIN");
-
-        // Update request status
-        await pool.query(
-            `UPDATE cohost_requests SET status = 'rejected', reviewed_at = NOW(), payment_status = 'refunded' WHERE id = $1`,
-            [id]
-        );
-
-        // If payment was already held, refund it
-        if (request.payment_status === 'held') {
-            await pool.query(
-                `UPDATE users SET credits = credits + $1 WHERE id = $2`,
-                [request.price, request.guest_id]
-            );
-            await pool.query(
-                `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
-                 VALUES ($1, 'cohost_refund', $2, 'completed', $3, $4)`,
-                [request.guest_id, request.price, `CHREF-${id}`, `Refund for rejected co-post request #${id}`]
-            );
-        }
-
-        await pool.query("COMMIT");
-
-        // Get host name for notification
-        const hostInfo = await pool.query(`SELECT name FROM users WHERE id = $1`, [hostId]);
-        const hostName = hostInfo.rows[0]?.name || 'The creator';
-
-        // Notify guest
+        const refund = await refundCohostRequest(request.id);
+        const isRefunded = refund.status === "refunded";
         await createNotification(
             request.guest_id,
             'cohost_request_rejected',
             'Co-Post Request Declined',
-            `${hostName} declined your co-post request.${request.payment_status === 'held' ? ' Your payment of Kes. ' + request.price + ' has been refunded.' : ''}`,
-            { requestId: parseInt(id), hostId, hostName }
+            isRefunded
+                ? `The host declined your request. Your KES ${request.price} payment has been refunded.`
+                : `The host declined your request. Your KES ${request.price} M-Pesa refund is being processed.`,
+            { requestId: Number(id), hostId, refundStatus: refund.status }
         );
 
-        res.json({ message: "Co-post request rejected" });
+        res.json({ message: "Co-post request rejected", refundStatus: refund.status });
     } catch (error) {
-        await pool.query("ROLLBACK");
+        if (transactionStarted && client) await client.query("ROLLBACK").catch(() => {});
         console.error("Reject cohost request error:", error);
-        res.status(500).json({ error: "Failed to reject co-post request" });
+        res.status(500).json({ error: "The request was rejected, but refund processing could not be completed or initiated. Please contact support.", details: error.message });
+    } finally {
+        if (client) client.release();
     }
 });
 
 // POST /api/cohost/pay — Guest pays for an approved co-post request
-app.post("/api/cohost/pay", authenticateToken, async (req, res) => {
+app.post("/api/cohost/pay", authenticateToken, requireAccountType("creator", "business"), async (req, res) => {
+    let client;
+    let transactionStarted = false;
     try {
         const guestId = req.user.id;
         const { requestId, payment_method, phoneNumber } = req.body;
@@ -6293,101 +9346,82 @@ app.post("/api/cohost/pay", authenticateToken, async (req, res) => {
         if (!requestId || isNaN(requestId)) {
             return res.status(400).json({ error: "Invalid request ID" });
         }
-
-        // Verify the request is approved and belongs to the guest
-        const requestResult = await pool.query(
-            `SELECT * FROM cohost_requests WHERE id = $1 AND guest_id = $2 AND status = 'approved' AND payment_status = 'pending'`,
-            [requestId, guestId]
-        );
-
-        if (requestResult.rowCount === 0) {
-            return res.status(404).json({ error: "Approved co-post request not found or already paid" });
-        }
-
-        const request = requestResult.rows[0];
-
         if (payment_method === 'wallet') {
-            // Check guest's credit balance
-            const guestCredits = await pool.query(
-                `SELECT credits FROM users WHERE id = $1`, [guestId]
+            client = await pool.connect();
+            await client.query("BEGIN");
+            transactionStarted = true;
+            const requestResult = await client.query(
+                `SELECT * FROM cohost_requests
+                 WHERE id = $1 AND guest_id = $2 AND status = 'pending'
+                   AND payment_status IN ('pending', 'failed')
+                   AND (mpesa_transaction_id IS NULL OR payment_status = 'failed')
+                 FOR UPDATE`,
+                [requestId, guestId]
             );
-            const credits = parseInt(guestCredits.rows[0]?.credits || 0);
-
-            if (credits < request.price) {
-                return res.status(400).json({
-                    error: "Insufficient credits",
-                    required: request.price,
-                    available: credits
-                });
+            if (requestResult.rowCount === 0) {
+                await client.query("ROLLBACK");
+                transactionStarted = false;
+                return res.status(404).json({ error: "Unpaid co-post draft not found or payment already received" });
             }
-
-            await pool.query("BEGIN");
-
-            // Deduct from guest
-            await pool.query(
-                `UPDATE users SET credits = credits - $1 WHERE id = $2`,
+            const request = requestResult.rows[0];
+            const debit = await client.query(
+                `UPDATE users SET credits = credits - $1
+                 WHERE id = $2 AND credits >= $1
+                 RETURNING credits`,
                 [request.price, guestId]
             );
+            if (debit.rowCount === 0) {
+                await client.query("ROLLBACK");
+                transactionStarted = false;
+                return res.status(400).json({ error: "Insufficient purchased credits", required: request.price });
+            }
 
-            // Record guest payment transaction
             const txId = `CHPAY-${requestId}-${Date.now()}`;
-            await pool.query(
+            await client.query(
                 `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
                  VALUES ($1, 'cohost_payment', $2, 'completed', $3, $4)`,
                 [guestId, -request.price, txId, `Co-post payment to host #${request.host_id} for request #${requestId}`]
             );
-
-            // Process revenue split
-            await processCohostRevenueSplit(requestId, request.host_id, request.price, txId);
-
-            // Update request payment status
-            await pool.query(
-                `UPDATE cohost_requests SET payment_status = 'completed', payment_method = 'wallet' WHERE id = $1`,
-                [requestId]
+            await client.query(
+                `UPDATE cohost_requests
+                 SET status = 'pending_approval', payment_status = 'held', payment_method = 'wallet',
+                     payment_reference = $2, expires_at = NOW() + INTERVAL '24 hours'
+                 WHERE id = $1`,
+                [requestId, txId]
             );
-
-            // Create the actual co-post in the posts table
-            const postResult = await pool.query(
-                `INSERT INTO posts (user_id, type, title, caption, tags, images, video_url, audio_url, is_copost, cohost_request_id, cohost_host_id, status, is_draft)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9, $10, 'approved', FALSE)
-                 RETURNING id`,
-                [guestId, request.post_type || 'text', request.post_title, request.post_caption,
-                 request.post_tags || '{}', JSON.stringify(request.post_images || []),
-                 request.post_video_url, request.post_audio_url,
-                 requestId, request.host_id]
-            );
-
-            // Update request to published
-            await pool.query(
-                `UPDATE cohost_requests SET status = 'published' WHERE id = $1`,
-                [requestId]
-            );
-
-            await pool.query("COMMIT");
-
-            // Get guest name for notification
-            const guestInfo = await pool.query(`SELECT name FROM users WHERE id = $1`, [guestId]);
-            const guestName = guestInfo.rows[0]?.name || 'A creator';
-
-            // Notify host about the payment and published co-post
+            await client.query("COMMIT");
+            transactionStarted = false;
+            client.release();
+            client = null;
             await createNotification(
                 request.host_id,
-                'cohost_payment_received',
-                'Co-Post Published!',
-                `${guestName} has paid Kes. ${request.price} and their co-post is now live on your profile.`,
-                { requestId, guestId, guestName, postId: postResult.rows[0].id, amount: request.price }
+                'cohost_request_received',
+                'Paid Co-Post Awaiting Review',
+                `A guest paid Kes. ${request.price}. Review the co-post within 24 hours.`,
+                { requestId: Number(requestId), guestId, expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() }
             );
-
             res.json({
-                message: "Payment successful! Co-post is now published.",
-                postId: postResult.rows[0].id
+                message: "Payment held in escrow. The host has 24 hours to review your co-post.",
+                status: "pending_approval"
             });
 
         } else if (payment_method === 'mpesa') {
-            // M-Pesa STK Push flow
             if (!phoneNumber || !/^254\d{9}$/.test(phoneNumber)) {
                 return res.status(400).json({ error: "Invalid phone number. Must be in 254XXXXXXXXX format" });
             }
+            const reservation = await pool.query(
+                `UPDATE cohost_requests
+                 SET mpesa_transaction_id = $3, mpesa_phone = $4, payment_method = 'mpesa', payment_status = 'pending'
+                 WHERE id = $1 AND guest_id = $2 AND status = 'pending'
+                   AND payment_status IN ('pending', 'failed')
+                   AND (mpesa_transaction_id IS NULL OR payment_status = 'failed')
+                 RETURNING *`,
+                [requestId, guestId, `CHINIT-${requestId}-${Date.now()}`, phoneNumber]
+            );
+            if (reservation.rowCount === 0) {
+                return res.status(404).json({ error: "Unpaid co-post draft not found or payment already received" });
+            }
+            const request = reservation.rows[0];
 
             const token = await getAccessToken();
             const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
@@ -6413,25 +9447,46 @@ app.post("/api/cohost/pay", authenticateToken, async (req, res) => {
                 { headers: { Authorization: `Bearer ${token}` } }
             );
 
-            // Save the CheckoutRequestID
-            await pool.query(
-                `UPDATE cohost_requests SET mpesa_transaction_id = $1, payment_method = 'mpesa' WHERE id = $2`,
+            if (!response.data?.CheckoutRequestID) {
+                throw new Error(response.data?.ResponseDescription || "M-Pesa did not return a checkout request ID");
+            }
+
+            const checkoutSaved = await pool.query(
+                `UPDATE cohost_requests
+                 SET mpesa_transaction_id = $1
+                 WHERE id = $2 AND status = 'pending' AND payment_status = 'pending'`,
                 [response.data.CheckoutRequestID, requestId]
             );
+            if (checkoutSaved.rowCount === 0) {
+                throw new Error("Payment request changed before the M-Pesa checkout reference was saved");
+            }
 
-            res.json({ success: true, message: "M-Pesa payment initiated. Check your phone.", data: response.data });
+            res.json({ success: true, message: "M-Pesa payment initiated. The 24-hour review window starts after payment confirmation.", data: response.data });
         } else {
             return res.status(400).json({ error: "Invalid payment method. Use 'wallet' or 'mpesa'" });
         }
     } catch (error) {
-        await pool.query("ROLLBACK").catch(() => {});
+        if (transactionStarted && client) await client.query("ROLLBACK").catch(() => {});
+        if (req.body.payment_method === "mpesa" && req.body.requestId) {
+            await pool.query(
+                `UPDATE cohost_requests
+                 SET payment_status = 'failed', mpesa_transaction_id = NULL
+                 WHERE id = $1 AND guest_id = $2 AND status = 'pending'
+                   AND mpesa_transaction_id LIKE 'CHINIT-%'`,
+                [req.body.requestId, req.user.id]
+            ).catch((updateError) => console.error("Reset failed co-host STK reservation error:", updateError));
+        }
         console.error("Cohost payment error:", error);
         res.status(500).json({ error: "Payment failed", details: error.message });
+    } finally {
+        if (client) client.release();
     }
 });
 
 // POST /api/mpesa/callback_cohost — M-Pesa callback for co-host payments
 app.post("/api/mpesa/callback_cohost", async (req, res) => {
+    let client;
+    let transactionStarted = false;
     try {
         console.log("📥 Co-host M-Pesa callback:", JSON.stringify(req.body, null, 2));
 
@@ -6451,104 +9506,80 @@ app.post("/api/mpesa/callback_cohost", async (req, res) => {
 
         if (requestResult.rowCount === 0) {
             console.error("No matching co-host request for CheckoutRequestID:", CheckoutRequestID);
-            return res.status(404).json({ error: "Request not found" });
+            return res.sendStatus(200);
         }
 
         const request = requestResult.rows[0];
+        client = await pool.connect();
+        await client.query("BEGIN");
+        transactionStarted = true;
+        const locked = await client.query(
+            `SELECT * FROM cohost_requests WHERE id = $1 FOR UPDATE`,
+            [request.id]
+        );
+        const current = locked.rows[0];
+        if (current.status !== "pending" || current.payment_status !== "pending") {
+            await client.query("COMMIT");
+            transactionStarted = false;
+            return res.sendStatus(200);
+        }
 
         if (ResultCode === 0) {
-            // Payment successful
-            await pool.query("BEGIN");
-
-            const txId = transactionId || `CHMPESA-${request.id}-${Date.now()}`;
-
-            // Record guest payment
-            await pool.query(
+            const txId = transactionId || `CHMPESA-${current.id}-${Date.now()}`;
+            await client.query(
                 `INSERT INTO transactions (creator_id, type, amount, status, transaction_id, description)
                  VALUES ($1, 'cohost_payment', $2, 'completed', $3, $4)`,
-                [request.guest_id, -request.price, txId, `M-Pesa co-post payment to host #${request.host_id}`]
+                [current.guest_id, -current.price, txId, `M-Pesa co-post payment to host #${current.host_id} for request #${current.id}`]
             );
-
-            // Process revenue split
-            await processCohostRevenueSplit(request.id, request.host_id, request.price, txId);
-
-            // Create the actual co-post
-            const postResult = await pool.query(
-                `INSERT INTO posts (user_id, type, title, caption, tags, images, video_url, audio_url, is_copost, cohost_request_id, cohost_host_id, status, is_draft)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9, $10, 'approved', FALSE)
-                 RETURNING id`,
-                [request.guest_id, request.post_type || 'text', request.post_title, request.post_caption,
-                 request.post_tags || '{}', JSON.stringify(request.post_images || []),
-                 request.post_video_url, request.post_audio_url,
-                 request.id, request.host_id]
+            await client.query(
+                `UPDATE cohost_requests
+                 SET status = 'pending_approval', payment_status = 'held', payment_reference = $1,
+                     expires_at = NOW() + INTERVAL '24 hours'
+                 WHERE id = $2`,
+                [txId, current.id]
             );
-
-            // Update request status
-            await pool.query(
-                `UPDATE cohost_requests SET status = 'published', payment_status = 'completed', mpesa_transaction_id = $1 WHERE id = $2`,
-                [transactionId || CheckoutRequestID, request.id]
-            );
-
-            await pool.query("COMMIT");
-
-            // Get names for notifications
-            const guestInfo = await pool.query(`SELECT name FROM users WHERE id = $1`, [request.guest_id]);
-            const guestName = guestInfo.rows[0]?.name || 'A creator';
-
-            // Notify both parties
+            await client.query("COMMIT");
+            transactionStarted = false;
             await createNotification(
-                request.host_id,
-                'cohost_payment_received',
-                'Co-Post Published!',
-                `${guestName} has paid Kes. ${request.price} and their co-post is now live on your profile.`,
-                { requestId: request.id, guestId: request.guest_id, postId: postResult.rows[0].id, amount: request.price }
-            );
-
-            await createNotification(
-                request.guest_id,
-                'cohost_post_published',
-                'Your Co-Post is Live!',
-                `Your co-post has been published on the host's profile.`,
-                { requestId: request.id, postId: postResult.rows[0].id }
+                current.host_id,
+                'cohost_request_received',
+                'Paid Co-Post Awaiting Review',
+                `A guest paid Kes. ${current.price}. Review the co-post within 24 hours.`,
+                { requestId: current.id, guestId: current.guest_id }
             );
         } else {
-            // Payment failed
-            await pool.query(
-                `UPDATE cohost_requests SET payment_status = 'failed' WHERE id = $1`,
-                [request.id]
+            await client.query(
+                `UPDATE cohost_requests SET payment_status = 'failed', mpesa_transaction_id = NULL
+                 WHERE id = $1`,
+                [current.id]
             );
-
-            await createNotification(
-                request.guest_id,
-                'cohost_payment_failed',
-                'Co-Post Payment Failed',
-                `Your M-Pesa payment for the co-post failed. Please try again.`,
-                { requestId: request.id }
-            );
+            await client.query("COMMIT");
+            transactionStarted = false;
+            await createNotification(current.guest_id, 'cohost_payment_failed', 'Co-Post Payment Failed',
+                "Your M-Pesa payment did not complete. You can retry payment.", { requestId: current.id });
         }
 
         res.sendStatus(200);
     } catch (error) {
-        await pool.query("ROLLBACK").catch(() => {});
+        if (transactionStarted && client) await client.query("ROLLBACK").catch(() => {});
         console.error("Co-host M-Pesa callback error:", error);
         res.status(500).json({ error: "Callback processing failed" });
+    } finally {
+        if (client) client.release();
     }
 });
 
 // GET /api/cohost/daily-count/:hostId — Check how many co-posts host has approved today
-app.get("/api/cohost/daily-count/:hostId", authenticateToken, async (req, res) => {
+app.get("/api/cohost/daily-count/:hostId", authenticateToken, requireAccountType("creator"), async (req, res) => {
     try {
         const { hostId } = req.params;
         const result = await pool.query(
             `SELECT COUNT(*) as count FROM cohost_requests
-             WHERE host_id = $1 AND status IN ('approved', 'published') AND reviewed_at::date = CURRENT_DATE`,
+             WHERE host_id = $1 AND status = 'published'
+               AND reviewed_at >= NOW() - INTERVAL '24 hours'`,
             [hostId]
         );
-        const settings = await pool.query(
-            `SELECT max_daily_posts FROM cohost_settings WHERE creator_id = $1`,
-            [hostId]
-        );
-        const maxDaily = settings.rows[0]?.max_daily_posts || 10;
+        const maxDaily = 5;
         const count = parseInt(result.rows[0].count);
 
         res.json({ count, maxDaily, remaining: Math.max(0, maxDaily - count) });
@@ -6563,7 +9594,7 @@ app.get("/api/cohost/daily-count/:hostId", authenticateToken, async (req, res) =
 // ==========================================
 
 // POST /api/campaigns — Business creates a campaign & deposits into Escrow
-app.post("/api/campaigns", authenticateToken, async (req, res) => {
+app.post("/api/campaigns", authenticateToken, requireAccountType("business"), async (req, res) => {
     try {
         const businessId = req.user.id;
         const { title, description, budget, deliverables, deadline, payment_method, phoneNumber } = req.body;
@@ -6679,7 +9710,7 @@ app.post("/api/campaigns", authenticateToken, async (req, res) => {
 });
 
 // GET /api/campaigns — Creators browse open available campaigns
-app.get("/api/campaigns", authenticateToken, async (req, res) => {
+app.get("/api/campaigns", authenticateToken, requireAccountType("creator"), async (req, res) => {
     try {
         const { limit = 30, offset = 0, status = 'open' } = req.query;
 
@@ -6703,7 +9734,7 @@ app.get("/api/campaigns", authenticateToken, async (req, res) => {
 });
 
 // GET /api/campaigns/:id — Single campaign detail with proposals & ratings
-app.get("/api/campaigns/:id", authenticateToken, async (req, res) => {
+app.get("/api/campaigns/:id", authenticateToken, requireAccountType("creator", "business"), async (req, res) => {
     try {
         const { id } = req.params;
         const userId = req.user.id;
@@ -6765,7 +9796,7 @@ app.get("/api/campaigns/:id", authenticateToken, async (req, res) => {
 });
 
 // GET /api/business/campaigns — Business views all their created campaigns
-app.get("/api/business/campaigns", authenticateToken, async (req, res) => {
+app.get("/api/business/campaigns", authenticateToken, requireAccountType("business"), async (req, res) => {
     try {
         const businessId = req.user.id;
         const result = await pool.query(
@@ -6784,7 +9815,7 @@ app.get("/api/business/campaigns", authenticateToken, async (req, res) => {
 });
 
 // GET /api/creator/campaign-proposals — Creator views all their submitted proposals
-app.get("/api/creator/campaign-proposals", authenticateToken, async (req, res) => {
+app.get("/api/creator/campaign-proposals", authenticateToken, requireAccountType("creator"), async (req, res) => {
     try {
         const creatorId = req.user.id;
         const result = await pool.query(
@@ -6805,7 +9836,7 @@ app.get("/api/creator/campaign-proposals", authenticateToken, async (req, res) =
 });
 
 // POST /api/campaigns/:id/proposals — Creator submits proposal (enforces 5 purchased credits deduction)
-app.post("/api/campaigns/:id/proposals", authenticateToken, async (req, res) => {
+app.post("/api/campaigns/:id/proposals", authenticateToken, requireAccountType("creator"), async (req, res) => {
     try {
         const creatorId = req.user.id;
         const campaignId = req.params.id;
@@ -6886,7 +9917,7 @@ app.post("/api/campaigns/:id/proposals", authenticateToken, async (req, res) => 
 });
 
 // PUT /api/campaigns/:id/proposals/:proposalId/accept — Brand accepts proposal
-app.put("/api/campaigns/:id/proposals/:proposalId/accept", authenticateToken, async (req, res) => {
+app.put("/api/campaigns/:id/proposals/:proposalId/accept", authenticateToken, requireAccountType("business"), async (req, res) => {
     try {
         const businessId = req.user.id;
         const { id: campaignId, proposalId } = req.params;
@@ -6934,7 +9965,7 @@ app.put("/api/campaigns/:id/proposals/:proposalId/accept", authenticateToken, as
 });
 
 // PUT /api/campaigns/:id/proposals/:proposalId/reject — Brand rejects proposal
-app.put("/api/campaigns/:id/proposals/:proposalId/reject", authenticateToken, async (req, res) => {
+app.put("/api/campaigns/:id/proposals/:proposalId/reject", authenticateToken, requireAccountType("business"), async (req, res) => {
     try {
         const businessId = req.user.id;
         const { id: campaignId, proposalId } = req.params;
@@ -6966,7 +9997,7 @@ app.put("/api/campaigns/:id/proposals/:proposalId/reject", authenticateToken, as
 });
 
 // PUT /api/campaigns/:id/deliver — Creator delivers campaign post
-app.put("/api/campaigns/:id/deliver", authenticateToken, async (req, res) => {
+app.put("/api/campaigns/:id/deliver", authenticateToken, requireAccountType("creator"), async (req, res) => {
     try {
         const creatorId = req.user.id;
         const campaignId = req.params.id;
@@ -7020,7 +10051,7 @@ app.put("/api/campaigns/:id/deliver", authenticateToken, async (req, res) => {
 });
 
 // PUT /api/campaigns/:id/approve-delivery — Brand approves deliverable -> releases Escrow
-app.put("/api/campaigns/:id/approve-delivery", authenticateToken, async (req, res) => {
+app.put("/api/campaigns/:id/approve-delivery", authenticateToken, requireAccountType("business"), async (req, res) => {
     try {
         const businessId = req.user.id;
         const campaignId = req.params.id;
@@ -7116,7 +10147,7 @@ app.put("/api/campaigns/:id/approve-delivery", authenticateToken, async (req, re
 });
 
 // POST /api/campaigns/:id/rate — Rate & review the other party
-app.post("/api/campaigns/:id/rate", authenticateToken, async (req, res) => {
+app.post("/api/campaigns/:id/rate", authenticateToken, requireAccountType("creator", "business"), async (req, res) => {
     try {
         const raterId = req.user.id;
         const campaignId = req.params.id;
@@ -7231,25 +10262,47 @@ app.put("/api/notifications/read-all", authenticateToken, async (req, res) => {
 
 // ========== CO-HOST AUTO-EXPIRY CRON ==========
 
-// Run every 30 minutes — expire pending co-host requests older than 24 hours
-cron.schedule('*/30 * * * *', async () => {
+// Check every minute so the paid 24-hour review deadline is enforced promptly.
+cron.schedule('* * * * *', async () => {
     try {
         const result = await pool.query(`
-            UPDATE cohost_requests SET status = 'expired'
-            WHERE status = 'pending' AND expires_at < NOW()
+            UPDATE cohost_requests SET status = 'expired', reviewed_at = NOW()
+            WHERE status = 'pending_approval' AND payment_status = 'held' AND expires_at <= NOW()
             RETURNING id, guest_id, host_id
         `);
 
         if (result.rowCount > 0) {
             console.log(`⏰ Expired ${result.rowCount} co-host request(s)`);
             for (const req of result.rows) {
+                let refundStatus = "failed";
+                try {
+                    const refund = await refundCohostRequest(req.id);
+                    refundStatus = refund.status;
+                } catch (error) {
+                    console.error(`Co-host timeout refund failed for request #${req.id}:`, error);
+                }
                 await createNotification(
                     req.guest_id,
                     'cohost_request_expired',
                     'Co-Post Request Expired',
-                    'Your co-post request has expired after 24 hours without a response from the host.',
-                    { requestId: req.id, hostId: req.host_id }
+                    refundStatus === "refunded"
+                        ? 'The host did not respond within 24 hours. Your payment has been refunded.'
+                        : 'The host did not respond within 24 hours. Your refund is being processed.',
+                    { requestId: req.id, hostId: req.host_id, refundStatus }
                 );
+            }
+        }
+
+        const failedRefunds = await pool.query(
+            `SELECT id FROM cohost_requests
+             WHERE status IN ('rejected', 'expired') AND payment_status = 'held'
+             ORDER BY reviewed_at NULLS FIRST LIMIT 25`
+        );
+        for (const request of failedRefunds.rows) {
+            try {
+                await refundCohostRequest(request.id);
+            } catch (error) {
+                console.error(`Co-host refund retry failed for request #${request.id}:`, error);
             }
         }
     } catch (error) {
@@ -7535,8 +10588,8 @@ app.get("/api/following/posts", authenticateToken, async (req, res) => {
                 p.images, p.video_url, p.audio_url, p.created_at, p.views,
                 p.duration, p.read_time, p.is_premium, p.visibility,
                 p.is_copost, p.cohost_host_id,
-                u.name AS creator_name, cp.profile_image AS creator_avatar,
-                hu.name AS host_name, hcp.profile_image AS host_avatar,
+                u.name AS creator_name, u.username AS creator_username, cp.profile_image AS creator_avatar,
+                hu.name AS host_name, hu.username AS host_username, hcp.profile_image AS host_avatar,
                 u.badge_level AS creator_badge_level,
                 COUNT(DISTINCT l.id) AS likes, COUNT(DISTINCT c.id) AS comments,
                 EXISTS(SELECT 1 FROM likes WHERE user_id = $1 AND post_id = p.id) AS is_liked,
@@ -7555,7 +10608,7 @@ app.get("/api/following/posts", authenticateToken, async (req, res) => {
               AND p.expires_at > NOW()
               AND p.visibility IN ('public', 'followers')
               AND p.is_premium = FALSE
-            GROUP BY p.id, u.name, cp.profile_image, hu.name, hcp.profile_image, u.badge_level
+            GROUP BY p.id, u.name, u.username, cp.profile_image, hu.name, hu.username, hcp.profile_image, u.badge_level
             ORDER BY p.created_at DESC
             LIMIT $2 OFFSET $3
         `, [userId, parsedLimit, parsedOffset]);
@@ -7576,6 +10629,7 @@ app.get("/api/following/posts", authenticateToken, async (req, res) => {
             isPremium: post.is_premium,
             visibility: post.visibility,
             creatorName: post.creator_name,
+            creatorUsername: post.creator_username || null,
             creatorAvatar: post.creator_avatar || "https://placehold.co/40x40",
             creatorBadgeLevel: post.creator_badge_level || 0,
             likes: parseInt(post.likes) || 0,
@@ -7585,6 +10639,7 @@ app.get("/api/following/posts", authenticateToken, async (req, res) => {
             isCopost: post.is_copost || false,
             cohostHostId: post.cohost_host_id || null,
             hostName: post.host_name || null,
+            hostUsername: post.host_username || null,
             hostAvatar: post.host_avatar || null
         }));
 
@@ -7807,4 +10862,3 @@ try {
     res.status(500).json({ error: 'Failed to start conversation' });
 }
 });
-
