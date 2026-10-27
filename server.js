@@ -654,7 +654,7 @@ pool.query(`
 pool.query(`
     CREATE TABLE IF NOT EXISTS cohost_settings (
         creator_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-        enabled BOOLEAN DEFAULT FALSE,
+        enabled BOOLEAN DEFAULT TRUE,
         price INTEGER NOT NULL DEFAULT 100 CHECK (price >= 100),
         max_daily_posts INTEGER DEFAULT 5,
         description TEXT,
@@ -662,12 +662,29 @@ pool.query(`
     )
 `).then(() => pool.query(`
     ALTER TABLE cohost_settings DROP CONSTRAINT IF EXISTS cohost_settings_price_check;
+    ALTER TABLE cohost_settings ALTER COLUMN enabled SET DEFAULT TRUE;
     ALTER TABLE cohost_settings ALTER COLUMN price SET DEFAULT 100;
     ALTER TABLE cohost_settings ALTER COLUMN max_daily_posts SET DEFAULT 5;
     UPDATE cohost_settings SET max_daily_posts = 5 WHERE max_daily_posts IS DISTINCT FROM 5;
     ALTER TABLE cohost_settings ADD CONSTRAINT cohost_settings_price_check CHECK (price >= 100);
-`)).then(() => console.log("Co-host settings table ready"))
-  .catch(err => console.error("Error creating cohost_settings table:", err));
+`)).then(() => pool.query(`
+    CREATE TABLE IF NOT EXISTS mpp_feature_migrations (
+        name VARCHAR(100) PRIMARY KEY,
+        applied_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+`)).then(() => pool.query(`
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM mpp_feature_migrations
+            WHERE name = 'cohosting-enabled-by-default'
+        ) THEN
+            UPDATE cohost_settings SET enabled = TRUE WHERE enabled IS DISTINCT FROM TRUE;
+            INSERT INTO mpp_feature_migrations (name) VALUES ('cohosting-enabled-by-default');
+        END IF;
+    END $$;
+`)).then(() => console.log("Co-host settings and enabled-by-default migration ready"))
+  .catch(err => console.error("Error migrating cohost settings:", err));
 
 // Co-Host Requests table — tracks co-post requests from Guest to Host
 pool.query(`
@@ -979,6 +996,8 @@ const ALL_ADMIN_PERMISSIONS = Object.freeze([
     "accounts.status",
     "moderation.read",
     "moderation.decide",
+    "posts.read",
+    "posts.manage",
     "finance.read",
     "finance.export",
     "finance.action",
@@ -1045,7 +1064,7 @@ app.get("/verify-moderator", authenticateToken, async (req, res) => {
     }
 });
 
-const MODERATION_CONTENT_TYPES = Object.freeze(["image", "video", "audio", "article", "gallery"]);
+const MODERATION_CONTENT_TYPES = Object.freeze(["image", "video", "audio", "article", "gallery", "text"]);
 const MODERATION_REPORT_REASONS = Object.freeze([
     "inappropriate",
     "misleading",
@@ -1098,7 +1117,8 @@ app.get("/moderation/posts", authenticateToken, requirePermission("moderation.re
     }
 
     try {
-        const baseConditions = ["p.is_draft = FALSE", "p.expires_at > NOW()"];
+        const exactPostLookup = /^\d+$/.test(search);
+        const baseConditions = exactPostLookup ? [] : ["p.is_draft = FALSE", "p.expires_at > NOW()"];
         const params = [];
         const conditions = [...baseConditions];
         const countsParams = [];
@@ -1128,10 +1148,10 @@ app.get("/moderation/posts", authenticateToken, requirePermission("moderation.re
         }
         if (search) {
             const pattern = `%${escapeLikeValue(search)}%`;
-            params.push(pattern);
-            conditions.push(`(p.title ILIKE $${params.length} OR u.name ILIKE $${params.length})`);
-            countsParams.push(pattern);
-            countsConditions.push(`(p.title ILIKE $${countsParams.length} OR u.name ILIKE $${countsParams.length})`);
+            params.push(search, pattern);
+            conditions.push(`(p.id::text = $${params.length - 1} OR p.title ILIKE $${params.length} OR u.name ILIKE $${params.length} OR u.username ILIKE $${params.length})`);
+            countsParams.push(search, pattern);
+            countsConditions.push(`(p.id::text = $${countsParams.length - 1} OR p.title ILIKE $${countsParams.length} OR u.name ILIKE $${countsParams.length} OR u.username ILIKE $${countsParams.length})`);
         }
         if (createdFrom) {
             params.push(createdFrom);
@@ -6462,6 +6482,535 @@ app.get("/api/admin/accounts/:id/audit", authenticateToken, requirePermission("a
     }
 });
 
+// ========== Admin Posts ==========
+
+const ADMIN_POST_TYPES = Object.freeze(["image", "video", "audio", "article", "gallery", "text"]);
+const ADMIN_POST_STATUSES = Object.freeze(["pending", "approved", "flagged", "restricted"]);
+const ADMIN_POST_VISIBILITIES = Object.freeze(["public", "followers", "private", "restricted"]);
+const ADMIN_POST_LIFECYCLES = Object.freeze(["all", "active", "expired", "scheduled", "drafts"]);
+const ADMIN_POST_SORTS = Object.freeze([
+    "newest",
+    "oldest",
+    "expiry",
+    "expiry_desc",
+    "reports",
+    "views",
+    "shares",
+    "engagement"
+]);
+
+const ADMIN_POST_LIFECYCLE_SELECT = `CASE
+    WHEN p.is_draft = TRUE THEN 'draft'
+    WHEN p.expires_at <= NOW() THEN 'expired'
+    WHEN p.scheduled_at IS NOT NULL AND p.scheduled_at > NOW() THEN 'scheduled'
+    ELSE 'active'
+END`;
+
+const ADMIN_POST_LIFECYCLE_CONDITIONS = Object.freeze({
+    active: "p.is_draft = FALSE AND p.expires_at > NOW()",
+    expired: "p.expires_at <= NOW()",
+    scheduled: "p.is_draft = FALSE AND p.expires_at > NOW() AND p.scheduled_at IS NOT NULL AND p.scheduled_at > NOW()",
+    drafts: "p.is_draft = TRUE"
+});
+
+function mapAdminPostPerson(row, prefix) {
+    const id = row[`${prefix}_id`];
+    if (id === null || id === undefined) return null;
+    return {
+        id,
+        name: row[`${prefix}_name`] || null,
+        username: row[`${prefix}_username`] || null,
+        profileImage: row[`${prefix}_profile_image`] || null,
+        badgeLevel: row[`${prefix}_badge_level`] || 0
+    };
+}
+
+function mapAdminPostSummary(row) {
+    return {
+        id: row.id,
+        userId: row.user_id,
+        type: row.type,
+        title: row.title,
+        captionPreview: row.caption_preview || null,
+        tags: Array.isArray(row.tags) ? row.tags : [],
+        isDraft: !!row.is_draft,
+        isPremium: !!row.is_premium,
+        isCopost: !!row.is_copost,
+        scheduledAt: row.scheduled_at || null,
+        visibility: row.visibility || "public",
+        status: row.status || "pending",
+        lifecycle: row.lifecycle,
+        views: row.views || 0,
+        shares: row.shares || 0,
+        likeCount: row.like_count || 0,
+        commentCount: row.comment_count || 0,
+        reportCount: row.report_count || 0,
+        firstImage: typeof row.first_image === "string"
+            ? row.first_image
+            : (row.first_image && (row.first_image.url || row.first_image.src)) || null,
+        createdAt: row.created_at,
+        expiresAt: row.expires_at,
+        extendedDays: row.extended_days || 0,
+        creator: mapAdminPostPerson(row, "creator"),
+        cohost: mapAdminPostPerson(row, "cohost"),
+        campaign: row.campaign_id
+            ? {
+                id: row.campaign_id,
+                title: row.campaign_title,
+                status: row.campaign_status
+            }
+            : null
+    };
+}
+
+app.get("/api/admin/posts", authenticateToken, requirePermission("posts.read"), async (req, res) => {
+    const search = typeof req.query.search === "string"
+        ? req.query.search.trim().slice(0, 120)
+        : "";
+    const creator = typeof req.query.creator === "string"
+        ? req.query.creator.trim().slice(0, 120)
+        : "";
+    const lifecycle = typeof req.query.lifecycle === "string" ? req.query.lifecycle : "all";
+    const type = typeof req.query.type === "string" ? req.query.type : "all";
+    const status = typeof req.query.status === "string" ? req.query.status : "all";
+    const visibility = typeof req.query.visibility === "string" ? req.query.visibility : "all";
+    const reports = typeof req.query.reports === "string" ? req.query.reports : "all";
+    const sort = typeof req.query.sort === "string" ? req.query.sort : "newest";
+    const createdFrom = typeof req.query.created_from === "string" ? req.query.created_from : "";
+    const createdTo = typeof req.query.created_to === "string" ? req.query.created_to : "";
+    const expiresFrom = typeof req.query.expires_from === "string" ? req.query.expires_from : "";
+    const expiresTo = typeof req.query.expires_to === "string" ? req.query.expires_to : "";
+    const limit = parseBoundedInt(req.query.limit, 25, 1, 100);
+    const offset = parseBoundedInt(req.query.offset, 0, 0, 1000000);
+
+    if (!ADMIN_POST_LIFECYCLES.includes(lifecycle)) {
+        return res.status(400).json({ error: "Invalid lifecycle filter" });
+    }
+    if (type !== "all" && !ADMIN_POST_TYPES.includes(type)) {
+        return res.status(400).json({ error: "Invalid content type filter" });
+    }
+    if (status !== "all" && !ADMIN_POST_STATUSES.includes(status)) {
+        return res.status(400).json({ error: "Invalid moderation status filter" });
+    }
+    if (visibility !== "all" && !ADMIN_POST_VISIBILITIES.includes(visibility)) {
+        return res.status(400).json({ error: "Invalid visibility filter" });
+    }
+    if (!["all", "reported", "unreported"].includes(reports)) {
+        return res.status(400).json({ error: "Invalid reports filter" });
+    }
+    if (!ADMIN_POST_SORTS.includes(sort)) {
+        return res.status(400).json({ error: "Invalid sort option" });
+    }
+    if (createdFrom && !isValidDateOnly(createdFrom)) {
+        return res.status(400).json({ error: "Invalid created_from date" });
+    }
+    if (createdTo && !isValidDateOnly(createdTo)) {
+        return res.status(400).json({ error: "Invalid created_to date" });
+    }
+    if (createdFrom && createdTo && createdFrom > createdTo) {
+        return res.status(400).json({ error: "created_from must be before created_to" });
+    }
+    if (expiresFrom && !isValidDateOnly(expiresFrom)) {
+        return res.status(400).json({ error: "Invalid expires_from date" });
+    }
+    if (expiresTo && !isValidDateOnly(expiresTo)) {
+        return res.status(400).json({ error: "Invalid expires_to date" });
+    }
+    if (expiresFrom && expiresTo && expiresFrom > expiresTo) {
+        return res.status(400).json({ error: "expires_from must be before expires_to" });
+    }
+    if (limit === null) {
+        return res.status(400).json({ error: "Limit must be between 1 and 100" });
+    }
+    if (offset === null) {
+        return res.status(400).json({ error: "Offset is invalid" });
+    }
+
+    try {
+        const conditions = [];
+        const params = [];
+
+        if (search) {
+            const escaped = escapeLikeValue(search);
+            const exactParam = params.length + 1;
+            params.push(search, `%${escaped}%`);
+            const likeParam = params.length;
+            conditions.push(`(
+                p.id::text = $${exactParam}
+                OR p.title ILIKE $${likeParam}
+                OR p.caption ILIKE $${likeParam}
+                OR COALESCE(array_to_string(p.tags, ' '), '') ILIKE $${likeParam}
+                OR u.name ILIKE $${likeParam}
+                OR u.username ILIKE $${likeParam}
+            )`);
+        }
+        if (creator) {
+            const escaped = escapeLikeValue(creator);
+            const exactParam = params.length + 1;
+            params.push(creator, `%${escaped}%`, `%${escaped}%`);
+            conditions.push(`(
+                u.id::text = $${exactParam}
+                OR u.name ILIKE $${exactParam + 1}
+                OR u.username ILIKE $${exactParam + 2}
+            )`);
+        }
+        if (type !== "all") {
+            params.push(type);
+            conditions.push(`p.type = $${params.length}`);
+        }
+        if (status !== "all") {
+            params.push(status);
+            conditions.push(`p.status = $${params.length}`);
+        }
+        if (visibility !== "all") {
+            params.push(visibility);
+            conditions.push(`p.visibility = $${params.length}`);
+        }
+        if (reports === "reported") {
+            conditions.push("EXISTS (SELECT 1 FROM reports rp WHERE rp.post_id = p.id)");
+        } else if (reports === "unreported") {
+            conditions.push("NOT EXISTS (SELECT 1 FROM reports rp WHERE rp.post_id = p.id)");
+        }
+        if (createdFrom) {
+            params.push(createdFrom);
+            conditions.push(`p.created_at >= $${params.length}::date`);
+        }
+        if (createdTo) {
+            params.push(createdTo);
+            conditions.push(`p.created_at < ($${params.length}::date + INTERVAL '1 day')`);
+        }
+        if (expiresFrom) {
+            params.push(expiresFrom);
+            conditions.push(`p.expires_at >= $${params.length}::date`);
+        }
+        if (expiresTo) {
+            params.push(expiresTo);
+            conditions.push(`p.expires_at < ($${params.length}::date + INTERVAL '1 day')`);
+        }
+
+        const filterWhereSql = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+        const whereConditions = [...conditions];
+        if (lifecycle !== "all") {
+            whereConditions.push(ADMIN_POST_LIFECYCLE_CONDITIONS[lifecycle]);
+        }
+        const whereSql = whereConditions.length ? `WHERE ${whereConditions.join(" AND ")}` : "";
+
+        const orderBy = {
+            newest: "p.created_at DESC, p.id DESC",
+            oldest: "p.created_at ASC, p.id ASC",
+            expiry: "p.expires_at ASC, p.id DESC",
+            expiry_desc: "p.expires_at DESC, p.id DESC",
+            reports: "report_count DESC, p.created_at DESC, p.id DESC",
+            views: "p.views DESC NULLS LAST, p.created_at DESC, p.id DESC",
+            shares: "p.shares DESC NULLS LAST, p.created_at DESC, p.id DESC",
+            engagement: "(COALESCE(p.views, 0) + COALESCE(p.shares, 0) + (SELECT COUNT(*) FROM likes le WHERE le.post_id = p.id) + (SELECT COUNT(*) FROM comments ce WHERE ce.post_id = p.id)) DESC, p.created_at DESC, p.id DESC"
+        }[sort];
+
+        const totalResult = await pool.query(
+            `SELECT COUNT(*)::int AS total
+             FROM posts p
+             LEFT JOIN users u ON u.id = p.user_id
+             ${whereSql}`,
+            params
+        );
+        const total = totalResult.rows[0].total;
+
+        const lifecycleCountsResult = await pool.query(
+            `SELECT
+                COUNT(*)::int AS total,
+                (COUNT(*) FILTER (WHERE ${ADMIN_POST_LIFECYCLE_CONDITIONS.active}))::int AS active,
+                (COUNT(*) FILTER (WHERE ${ADMIN_POST_LIFECYCLE_CONDITIONS.expired}))::int AS expired,
+                (COUNT(*) FILTER (WHERE ${ADMIN_POST_LIFECYCLE_CONDITIONS.scheduled}))::int AS scheduled,
+                (COUNT(*) FILTER (WHERE ${ADMIN_POST_LIFECYCLE_CONDITIONS.drafts}))::int AS drafts
+             FROM posts p
+             LEFT JOIN users u ON u.id = p.user_id
+             ${filterWhereSql}`,
+            params
+        );
+        const lifecycleCounts = lifecycleCountsResult.rows[0];
+
+        const dataResult = await pool.query(
+            `SELECT
+                p.id, p.user_id, p.type, p.title,
+                CASE
+                    WHEN LENGTH(COALESCE(p.caption, '')) > 220
+                    THEN LEFT(p.caption, 220) || '...'
+                    ELSE p.caption
+                END AS caption_preview,
+                array_to_json(p.tags) AS tags,
+                p.created_at, p.expires_at, p.extended_days,
+                p.is_draft, p.is_premium, p.is_copost, p.scheduled_at,
+                p.visibility, p.views, p.shares, p.status,
+                CASE
+                    WHEN jsonb_typeof(p.images) = 'array' AND jsonb_array_length(p.images) > 0
+                    THEN p.images->0
+                    ELSE NULL
+                END AS first_image,
+                ${ADMIN_POST_LIFECYCLE_SELECT} AS lifecycle,
+                u.id AS creator_id, u.name AS creator_name, u.username AS creator_username,
+                u.badge_level AS creator_badge_level, cp.profile_image AS creator_profile_image,
+                hu.id AS cohost_id, hu.name AS cohost_name, hu.username AS cohost_username,
+                hu.badge_level AS cohost_badge_level, hcp.profile_image AS cohost_profile_image,
+                (SELECT COUNT(*)::int FROM reports r WHERE r.post_id = p.id) AS report_count,
+                (SELECT COUNT(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count,
+                (SELECT COUNT(*)::int FROM comments c WHERE c.post_id = p.id) AS comment_count,
+                lc.id AS campaign_id, lc.title AS campaign_title, lc.status AS campaign_status
+             FROM posts p
+             LEFT JOIN users u ON u.id = p.user_id
+             LEFT JOIN creators_page cp ON cp.user_id = p.user_id
+             LEFT JOIN users hu ON hu.id = p.cohost_host_id
+             LEFT JOIN creators_page hcp ON hcp.user_id = p.cohost_host_id
+             LEFT JOIN LATERAL (
+                SELECT c.id, c.title, c.status
+                FROM campaign_proposals cpj
+                JOIN campaigns c ON c.id = cpj.campaign_id
+                WHERE cpj.post_id = p.id
+                ORDER BY cpj.id DESC
+                LIMIT 1
+             ) lc ON TRUE
+             ${whereSql}
+             ORDER BY ${orderBy}
+             LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+            [...params, limit, offset]
+        );
+
+        res.json({
+            items: dataResult.rows.map(mapAdminPostSummary),
+            total,
+            lifecycleCounts: {
+                all: lifecycleCounts.total || 0,
+                active: lifecycleCounts.active || 0,
+                expired: lifecycleCounts.expired || 0,
+                scheduled: lifecycleCounts.scheduled || 0,
+                drafts: lifecycleCounts.drafts || 0
+            },
+            pagination: {
+                limit,
+                offset,
+                total,
+                page: Math.floor(offset / limit) + 1,
+                pages: total === 0 ? 0 : Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        console.error("Admin posts list error:", error);
+        res.status(500).json({ error: "Failed to load posts" });
+    }
+});
+
+app.get("/api/admin/posts/:id/history", authenticateToken, requirePermission("posts.read"), async (req, res) => {
+    const postId = parseAccountId(req.params.id);
+    if (!postId) {
+        return res.status(400).json({ error: "Invalid post ID" });
+    }
+
+    const limit = parseBoundedInt(req.query.limit, 20, 1, 100);
+    const offset = parseBoundedInt(req.query.offset, 0, 0, 1000000);
+    if (limit === null) {
+        return res.status(400).json({ error: "Limit must be between 1 and 100" });
+    }
+    if (offset === null) {
+        return res.status(400).json({ error: "Offset is invalid" });
+    }
+
+    try {
+        const exists = await pool.query("SELECT 1 FROM posts WHERE id = $1", [postId]);
+        if (exists.rowCount === 0) {
+            return res.status(404).json({ error: "Post not found" });
+        }
+
+        const countResult = await pool.query(
+            `SELECT COUNT(*)::int AS total
+             FROM admin_audit_log
+             WHERE target_type = 'post' AND target_id = $1`,
+            [postId]
+        );
+        const total = countResult.rows[0].total;
+
+        const result = await pool.query(
+            `SELECT
+                a.id, a.action, a.reason, a.before_state, a.after_state,
+                a.request_id, a.created_at, a.actor_id,
+                u.name AS actor_name, u.email AS actor_email
+             FROM admin_audit_log a
+             LEFT JOIN users u ON u.id = a.actor_id
+             WHERE a.target_type = 'post' AND a.target_id = $1
+             ORDER BY a.created_at DESC, a.id DESC
+             LIMIT $2 OFFSET $3`,
+            [postId, limit, offset]
+        );
+
+        res.json({
+            items: result.rows.map((row) => ({
+                id: row.id,
+                action: row.action,
+                reason: row.reason,
+                beforeState: row.before_state,
+                afterState: row.after_state,
+                requestId: row.request_id,
+                createdAt: row.created_at,
+                actor: row.actor_name
+                    ? { id: row.actor_id, name: row.actor_name, email: row.actor_email }
+                    : null
+            })),
+            total,
+            pagination: {
+                limit,
+                offset,
+                total,
+                page: Math.floor(offset / limit) + 1,
+                pages: total === 0 ? 0 : Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        console.error("Admin post history error:", error);
+        res.status(500).json({ error: "Failed to load post history" });
+    }
+});
+
+app.get("/api/admin/posts/:id", authenticateToken, requirePermission("posts.read"), async (req, res) => {
+    const postId = parseAccountId(req.params.id);
+    if (!postId) {
+        return res.status(400).json({ error: "Invalid post ID" });
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT
+                p.id, p.user_id, p.type, p.title, p.caption, p.tags, p.images,
+                p.video_url, p.audio_url, p.duration, p.read_time,
+                p.created_at, p.expires_at, p.extended_days,
+                p.is_draft, p.is_premium, p.is_copost, p.scheduled_at,
+                p.visibility, p.views, p.shares, p.status,
+                p.cohost_request_id, p.cohost_host_id,
+                ${ADMIN_POST_LIFECYCLE_SELECT} AS lifecycle,
+                u.id AS creator_id, u.name AS creator_name, u.username AS creator_username,
+                u.badge_level AS creator_badge_level, cp.profile_image AS creator_profile_image,
+                hu.id AS cohost_id, hu.name AS cohost_name, hu.username AS cohost_username,
+                hu.badge_level AS cohost_badge_level, hcp.profile_image AS cohost_profile_image,
+                (SELECT COUNT(*)::int FROM reports r WHERE r.post_id = p.id) AS report_count,
+                (SELECT COUNT(*)::int FROM reports r WHERE r.post_id = p.id AND r.status = 'pending') AS open_report_count,
+                (SELECT COUNT(*)::int FROM reports r WHERE r.post_id = p.id AND r.status = 'resolved') AS resolved_report_count,
+                (SELECT MAX(r.timestamp) FROM reports r WHERE r.post_id = p.id) AS latest_report_at,
+                (SELECT COALESCE(array_agg(DISTINCT r.reason::text), ARRAY[]::text[])
+                 FROM reports r WHERE r.post_id = p.id) AS report_reasons,
+                (SELECT COUNT(*)::int FROM likes l WHERE l.post_id = p.id) AS like_count,
+                (SELECT COUNT(*)::int FROM comments c WHERE c.post_id = p.id) AS comment_count,
+                (SELECT COUNT(*)::int FROM bookmarks b WHERE b.post_id = p.id) AS bookmark_count,
+                lc.id AS campaign_id, lc.title AS campaign_title, lc.status AS campaign_status,
+                cr.status AS cohost_request_status
+             FROM posts p
+             LEFT JOIN users u ON u.id = p.user_id
+             LEFT JOIN creators_page cp ON cp.user_id = p.user_id
+             LEFT JOIN users hu ON hu.id = p.cohost_host_id
+             LEFT JOIN creators_page hcp ON hcp.user_id = p.cohost_host_id
+             LEFT JOIN cohost_requests cr ON cr.id = p.cohost_request_id
+             LEFT JOIN LATERAL (
+                SELECT c.id, c.title, c.status
+                FROM campaign_proposals cpj
+                JOIN campaigns c ON c.id = cpj.campaign_id
+                WHERE cpj.post_id = p.id
+                ORDER BY cpj.id DESC
+                LIMIT 1
+             ) lc ON TRUE
+             WHERE p.id = $1`,
+            [postId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: "Post not found" });
+        }
+
+        const row = result.rows[0];
+        const canReadModeration = req.staff.permissions.includes("moderation.read");
+        let reports = null;
+        if (canReadModeration) {
+            const reportResult = await pool.query(
+                `SELECT id, reason, message, status, timestamp
+                 FROM reports
+                 WHERE post_id = $1
+                 ORDER BY timestamp DESC NULLS LAST, id DESC
+                 LIMIT 20`,
+                [postId]
+            );
+            reports = reportResult.rows.map((report) => ({
+                id: report.id,
+                reason: report.reason,
+                message: report.message || "",
+                status: report.status || "pending",
+                reportedAt: report.timestamp
+            }));
+        }
+
+        res.json({
+            post: {
+                id: row.id,
+                userId: row.user_id,
+                type: row.type,
+                title: row.title,
+                caption: row.caption,
+                tags: Array.isArray(row.tags) ? row.tags : [],
+                images: Array.isArray(row.images) ? row.images : [],
+                videoUrl: row.video_url || null,
+                audioUrl: row.audio_url || null,
+                duration: row.duration || null,
+                readTime: row.read_time || null,
+                createdAt: row.created_at,
+                expiresAt: row.expires_at,
+                extendedDays: row.extended_days || 0,
+                isDraft: !!row.is_draft,
+                isPremium: !!row.is_premium,
+                isCopost: !!row.is_copost,
+                scheduledAt: row.scheduled_at || null,
+                visibility: row.visibility || "public",
+                status: row.status || "pending",
+                lifecycle: row.lifecycle,
+                views: row.views || 0,
+                shares: row.shares || 0,
+                cohostRequestId: row.cohost_request_id || null
+            },
+            creator: mapAdminPostPerson(row, "creator"),
+            cohost: mapAdminPostPerson(row, "cohost"),
+            engagement: {
+                views: row.views || 0,
+                shares: row.shares || 0,
+                likes: row.like_count || 0,
+                comments: row.comment_count || 0,
+                bookmarks: row.bookmark_count || 0
+            },
+            moderation: {
+                status: row.status || "pending",
+                visibility: row.visibility || "public",
+                reportCount: row.report_count || 0,
+                openReportCount: row.open_report_count || 0,
+                resolvedReportCount: row.resolved_report_count || 0,
+                latestReportAt: row.latest_report_at || null,
+                reportReasons: Array.isArray(row.report_reasons) ? row.report_reasons.filter(Boolean) : [],
+                reports,
+                reportsRestricted: !canReadModeration
+            },
+            relationships: {
+                campaign: row.campaign_id
+                    ? {
+                        id: row.campaign_id,
+                        title: row.campaign_title,
+                        status: row.campaign_status
+                    }
+                    : null,
+                cohostRequest: row.cohost_request_id
+                    ? {
+                        id: row.cohost_request_id,
+                        status: row.cohost_request_status || null
+                    }
+                    : null
+            }
+        });
+    } catch (error) {
+        console.error("Admin post detail error:", error);
+        res.status(500).json({ error: "Failed to load post" });
+    }
+});
+
 async function changeAccountAccessStatus(req, res, options) {
     const accountId = parseAccountId(req.params.id);
     if (!accountId) {
@@ -8935,16 +9484,20 @@ app.get("/api/cohost/settings/:creatorId", async (req, res) => {
     try {
         const { creatorId } = req.params;
         const result = await pool.query(
-            `SELECT cs.*, u.name as creator_name, cp.profile_image
-             FROM cohost_settings cs
-             JOIN users u ON cs.creator_id = u.id
-             LEFT JOIN creators_page cp ON cs.creator_id = cp.user_id
-             WHERE cs.creator_id = $1`,
+            `SELECT COALESCE(cs.enabled, TRUE) AS enabled,
+                    COALESCE(cs.price, 100) AS price,
+                    COALESCE(cs.max_daily_posts, 5) AS max_daily_posts,
+                    cs.description, u.id AS creator_id, u.name AS creator_name,
+                    cp.profile_image
+             FROM users u
+             JOIN creators_page cp ON cp.user_id = u.id
+             LEFT JOIN cohost_settings cs ON cs.creator_id = u.id
+             WHERE u.id = $1 AND COALESCE(u.account_type, 'creator') = 'creator'`,
             [creatorId]
         );
 
         if (result.rowCount === 0) {
-            return res.json({ enabled: false, price: 100, max_daily_posts: 5, creator_id: parseInt(creatorId) });
+            return res.status(404).json({ error: "Creator profile not found" });
         }
 
         res.json(result.rows[0]);
@@ -8962,21 +9515,10 @@ app.put("/api/cohost/settings", authenticateToken, requireAccountType("creator")
 
         // Verify creator
         const creatorCheck = await pool.query(
-            `SELECT id FROM creators_page WHERE user_id = $1`, [creatorId]
+            `SELECT 1 FROM creators_page WHERE user_id = $1`, [creatorId]
         );
         if (creatorCheck.rowCount === 0) {
             return res.status(403).json({ error: "You must be a creator to enable co-hosting" });
-        }
-
-        // Check eligibility if enabling
-        if (enabled) {
-            const eligibility = await checkCohostEligibility(creatorId);
-            if (!eligibility.eligible) {
-                return res.status(403).json({
-                    error: "You do not meet the requirements to host co-posts",
-                    requirements: eligibility.requirements
-                });
-            }
         }
 
         // Validate price
@@ -9020,9 +9562,13 @@ app.post("/api/cohost/request", authenticateToken, requireAccountType("creator",
 
         // Check host has co-hosting enabled
         const hostSettings = await pool.query(
-            `SELECT cs.* FROM cohost_settings cs
-             JOIN users u ON u.id = cs.creator_id AND u.account_type = 'creator'
-             WHERE cs.creator_id = $1 AND cs.enabled = TRUE`,
+            `SELECT COALESCE(cs.price, 100) AS price,
+                    COALESCE(cs.description, '') AS description
+             FROM users u
+             JOIN creators_page cp ON cp.user_id = u.id
+             LEFT JOIN cohost_settings cs ON cs.creator_id = u.id
+             WHERE u.id = $1 AND COALESCE(u.account_type, 'creator') = 'creator'
+               AND COALESCE(cs.enabled, TRUE) = TRUE`,
             [host_id]
         );
         if (hostSettings.rowCount === 0) {
