@@ -1013,7 +1013,7 @@ function permissionsForRole(role) {
     return ROLE_PERMISSIONS[role] || [];
 }
 
-const requirePermission = (permission) => async (req, res, next) => {
+const requireAnyPermission = (requiredPermissions) => async (req, res, next) => {
     try {
         const result = await pool.query(
             "SELECT id, name, email, role FROM users WHERE id = $1",
@@ -1025,11 +1025,12 @@ const requirePermission = (permission) => async (req, res, next) => {
 
         const staff = result.rows[0];
         const permissions = permissionsForRole(staff.role);
-        if (!permissions.includes(permission)) {
+        const allowed = Array.isArray(requiredPermissions) ? requiredPermissions : [requiredPermissions];
+        if (!allowed.some((permission) => permissions.includes(permission))) {
             return res.status(403).json({
                 error: "You do not have permission to perform this action",
                 code: "PERMISSION_DENIED",
-                permission
+                permission: allowed[0]
             });
         }
 
@@ -1046,6 +1047,8 @@ const requirePermission = (permission) => async (req, res, next) => {
         res.status(503).json({ error: "Unable to verify permissions" });
     }
 };
+
+const requirePermission = (permission) => requireAnyPermission([permission]);
 
 // Verify Moderator
 app.get("/verify-moderator", authenticateToken, async (req, res) => {
@@ -6057,6 +6060,7 @@ function mapAccountSummary(row) {
         id: row.id,
         name: row.name,
         email: row.email,
+        username: row.username || null,
         role: row.role || "user",
         accountType: row.account_type || "creator",
         isCreator: !!row.is_creator,
@@ -6102,6 +6106,426 @@ app.get("/api/admin/me", authenticateToken, async (req, res) => {
     } catch (error) {
         console.error("Admin session error:", error);
         res.status(500).json({ error: "Failed to load admin session" });
+    }
+});
+
+const OVERVIEW_PERIOD_DAYS = Object.freeze([7, 30, 90]);
+
+async function queryOverviewAccounts(days) {
+    const result = await pool.query(`
+        WITH account_activity AS (
+            SELECT
+                u.id,
+                u.created_at,
+                u.account_status,
+                CASE
+                    WHEN COALESCE(u.account_type, 'creator') = 'business' THEN 'business'
+                    WHEN u.is_creator THEN 'creator'
+                    ELSE 'member'
+                END AS account_kind,
+                GREATEST(
+                    u.created_at,
+                    COALESCE((SELECT MAX(p.created_at) FROM posts p WHERE p.user_id = u.id), u.created_at),
+                    COALESCE((SELECT MAX(t.created_at) FROM transactions t WHERE t.creator_id = u.id), u.created_at),
+                    COALESCE((SELECT MAX(m.created_at) FROM messages m WHERE m.sender_id = u.id), u.created_at)
+                ) AS last_activity_at
+            FROM users u
+        )
+        SELECT
+            COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE account_status = 'active')::int AS active,
+            COUNT(*) FILTER (WHERE account_status = 'suspended')::int AS suspended,
+            COUNT(*) FILTER (WHERE account_status = 'closed')::int AS closed,
+            COUNT(*) FILTER (WHERE account_kind = 'creator')::int AS creators,
+            COUNT(*) FILTER (WHERE account_kind = 'business')::int AS businesses,
+            COUNT(*) FILTER (WHERE account_kind = 'member')::int AS members,
+            COUNT(*) FILTER (WHERE created_at >= NOW() - ($1::int * INTERVAL '1 day'))::int AS new_in_period,
+            COUNT(*) FILTER (WHERE last_activity_at >= NOW() - ($1::int * INTERVAL '1 day'))::int AS active_in_period,
+            MAX(created_at) AS latest_created_at,
+            MAX(last_activity_at) AS latest_activity_at
+        FROM account_activity
+    `, [days]);
+
+    const row = result.rows[0] || {};
+    return {
+        total: Number(row.total) || 0,
+        active: Number(row.active) || 0,
+        suspended: Number(row.suspended) || 0,
+        closed: Number(row.closed) || 0,
+        creators: Number(row.creators) || 0,
+        businesses: Number(row.businesses) || 0,
+        members: Number(row.members) || 0,
+        newInPeriod: Number(row.new_in_period) || 0,
+        activeInPeriod: Number(row.active_in_period) || 0,
+        freshness: {
+            latestCreatedAt: row.latest_created_at || null,
+            latestActivityAt: row.latest_activity_at || null
+        }
+    };
+}
+
+async function queryOverviewModeration(days) {
+    const [countsResult, resolutionResult] = await Promise.all([
+        pool.query(`
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_posts,
+                COUNT(*) FILTER (WHERE status = 'flagged')::int AS flagged_posts,
+                COUNT(*) FILTER (WHERE status = 'restricted')::int AS restricted_posts,
+                COUNT(*) FILTER (WHERE status = 'approved')::int AS approved_posts,
+                (SELECT COUNT(*)::int FROM reports WHERE status = 'pending') AS open_reports,
+                (SELECT COUNT(DISTINCT post_id)::int FROM reports WHERE status = 'pending') AS posts_with_open_reports,
+                (SELECT COUNT(*)::int FROM reports
+                    WHERE timestamp >= NOW() - ($1::int * INTERVAL '1 day')) AS reports_in_period,
+                (SELECT MAX(timestamp) FROM reports) AS latest_report_at
+            FROM posts
+        `, [days]),
+        pool.query(`
+            WITH first_reports AS (
+                SELECT post_id, MIN(timestamp) AS first_report_at
+                FROM reports
+                GROUP BY post_id
+            ), resolutions AS (
+                SELECT target_id AS post_id, MIN(created_at) AS resolved_at
+                FROM admin_audit_log
+                WHERE action = 'moderation.post.status'
+                  AND after_state->>'status' IN ('approved', 'restricted')
+                GROUP BY target_id
+            )
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE r.resolved_at >= NOW() - ($1::int * INTERVAL '1 day')
+                )::int AS resolved_posts_in_period,
+                ROUND(
+                    (
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (
+                            ORDER BY EXTRACT(EPOCH FROM (r.resolved_at - f.first_report_at)) / 3600.0
+                        )
+                    )::numeric,
+                    1
+                )::float AS median_resolution_hours
+            FROM resolutions r
+            JOIN first_reports f ON f.post_id = r.post_id
+            WHERE r.resolved_at >= f.first_report_at
+              AND r.resolved_at >= NOW() - ($1::int * INTERVAL '1 day')
+        `, [days])
+    ]);
+
+    const counts = countsResult.rows[0] || {};
+    const resolution = resolutionResult.rows[0] || {};
+    return {
+        pendingPosts: Number(counts.pending_posts) || 0,
+        flaggedPosts: Number(counts.flagged_posts) || 0,
+        restrictedPosts: Number(counts.restricted_posts) || 0,
+        approvedPosts: Number(counts.approved_posts) || 0,
+        openReports: Number(counts.open_reports) || 0,
+        postsWithOpenReports: Number(counts.posts_with_open_reports) || 0,
+        reportsInPeriod: Number(counts.reports_in_period) || 0,
+        resolvedPostsInPeriod: Number(resolution.resolved_posts_in_period) || 0,
+        medianResolutionHours: resolution.median_resolution_hours === null
+            ? null
+            : Number(resolution.median_resolution_hours),
+        freshness: {
+            latestReportAt: counts.latest_report_at || null,
+            latestDecisionAt: null
+        }
+    };
+}
+
+async function queryOverviewPosts(days) {
+    const result = await pool.query(`
+        SELECT
+            COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE is_draft)::int AS drafts,
+            COUNT(*) FILTER (WHERE NOT is_draft AND expires_at <= NOW())::int AS expired,
+            COUNT(*) FILTER (WHERE NOT is_draft AND expires_at > NOW() AND scheduled_at > NOW())::int AS scheduled,
+            COUNT(*) FILTER (
+                WHERE NOT is_draft
+                  AND expires_at > NOW()
+                  AND (scheduled_at IS NULL OR scheduled_at <= NOW())
+            )::int AS active,
+            COUNT(*) FILTER (WHERE created_at >= NOW() - ($1::int * INTERVAL '1 day'))::int AS new_in_period,
+            MAX(created_at) AS latest_created_at
+        FROM posts
+    `, [days]);
+
+    const row = result.rows[0] || {};
+    return {
+        total: Number(row.total) || 0,
+        drafts: Number(row.drafts) || 0,
+        expired: Number(row.expired) || 0,
+        scheduled: Number(row.scheduled) || 0,
+        active: Number(row.active) || 0,
+        newInPeriod: Number(row.new_in_period) || 0,
+        freshness: {
+            latestCreatedAt: row.latest_created_at || null
+        }
+    };
+}
+
+async function queryOverviewFinance(days) {
+    const to = financeToday();
+    const from = financeDaysAgo(days - 1);
+    const [totals, escrow, latest] = await Promise.all([
+        queryFinancePeriodTotals(from, to),
+        queryFinanceEscrowPosition(),
+        pool.query("SELECT MAX(created_at) AS latest_transaction_at FROM transactions")
+    ]);
+
+    return {
+        period: { from, to, days },
+        currency: FINANCE_CURRENCY,
+        receipts: {
+            value: totals.external_receipts,
+            count: Number(totals.external_receipt_count) || 0
+        },
+        payouts: {
+            settled: totals.payouts_settled,
+            pending: totals.payouts_pending,
+            failed: totals.payouts_failed,
+            completedCount: Number(totals.completed_payout_count) || 0,
+            pendingCount: Number(totals.pending_payout_count) || 0,
+            failedCount: Number(totals.failed_payout_count) || 0,
+            staleValue: totals.stale_pending_payout_value,
+            staleCount: Number(totals.stale_pending_payout_count) || 0
+        },
+        escrow: {
+            held: escrow.held,
+            heldCount: Number(escrow.held_count) || 0
+        },
+        transactionCount: Number(totals.transaction_count) || 0,
+        freshness: {
+            latestTransactionAt: latest.rows[0] ? latest.rows[0].latest_transaction_at : null
+        }
+    };
+}
+
+async function queryOverviewRecentAudit(limit) {
+    const result = await pool.query(`
+        SELECT
+            a.id, a.action, a.target_type, a.target_id, a.reason, a.request_id,
+            to_char(a.created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at,
+            u.name AS actor_name
+        FROM admin_audit_log a
+        LEFT JOIN users u ON u.id = a.actor_id
+        ORDER BY a.created_at DESC, a.id DESC
+        LIMIT $1
+    `, [limit]);
+
+    return {
+        items: result.rows.map((row) => ({
+            id: row.id,
+            action: row.action,
+            targetType: row.target_type,
+            targetId: row.target_id,
+            reason: row.reason || null,
+            requestId: row.request_id || null,
+            createdAt: row.created_at || null,
+            actorName: row.actor_name || null
+        })),
+        latestAt: result.rows[0] ? result.rows[0].created_at : null
+    };
+}
+
+app.get("/api/admin/overview", authenticateToken, requireAnyPermission(ALL_ADMIN_PERMISSIONS), async (req, res) => {
+    const days = parseBoundedInt(req.query.days, 30, 1, 365);
+    if (days === null || !OVERVIEW_PERIOD_DAYS.includes(days)) {
+        return res.status(400).json({ error: "Period must be 7, 30, or 90 days" });
+    }
+
+    const permissions = req.staff.permissions;
+    const include = (permission) => permissions.includes(permission);
+
+    try {
+        const [accounts, moderation, posts, finance, recentActivity] = await Promise.all([
+            include("accounts.read") ? queryOverviewAccounts(days) : null,
+            include("moderation.read") ? queryOverviewModeration(days) : null,
+            include("posts.read") ? queryOverviewPosts(days) : null,
+            include("finance.read") ? queryOverviewFinance(days) : null,
+            include("staff.manage") ? queryOverviewRecentAudit(6) : null
+        ]);
+
+        if (moderation && !moderation.freshness.latestDecisionAt) {
+            const latestDecision = await pool.query(
+                `SELECT to_char(MAX(created_at), 'YYYY-MM-DD"T"HH24:MI:SS') AS latest_decision_at
+                 FROM admin_audit_log
+                 WHERE action = 'moderation.post.status'`
+            );
+            moderation.freshness.latestDecisionAt = latestDecision.rows[0]
+                ? latestDecision.rows[0].latest_decision_at
+                : null;
+        }
+
+        res.json({
+            generatedAt: new Date().toISOString(),
+            period: {
+                days,
+                from: new Date(Date.now() - days * 86400000).toISOString(),
+                to: new Date().toISOString()
+            },
+            accounts,
+            moderation,
+            posts,
+            finance,
+            recentActivity,
+            definitions: {
+                accounts: {
+                    activeAccess: "Accounts whose access status is active.",
+                    activeInPeriod: "Accounts created or with a post, transaction, or message in the selected period."
+                },
+                moderation: {
+                    openReports: "Reports with status pending.",
+                    medianResolutionHours: "Median hours from a post's first report to its first approved or restricted moderation decision in the selected period."
+                },
+                posts: {
+                    lifecycle: "Draft, expired, scheduled, and active counts are mutually exclusive. Drafts take precedence, then expired, then scheduled, then active."
+                },
+                finance: {
+                    receipts: "Completed positive subscription, credit-purchase, and reactivation transaction rows in the selected period.",
+                    payouts: "Payout transaction rows by status in the selected period. Provider settlement is not independently verified."
+                }
+            }
+        });
+    } catch (error) {
+        console.error("Admin overview error:", error);
+        res.status(500).json({ error: "Failed to load admin overview" });
+    }
+});
+
+app.get("/api/admin/audit", authenticateToken, requirePermission("staff.manage"), async (req, res) => {
+    const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 120) : "";
+    const action = typeof req.query.action === "string" ? req.query.action.trim() : "";
+    const targetType = typeof req.query.target_type === "string" ? req.query.target_type : "all";
+    const targetIdText = typeof req.query.target_id === "string" ? req.query.target_id.trim() : "";
+    const from = typeof req.query.from === "string" ? req.query.from : "";
+    const to = typeof req.query.to === "string" ? req.query.to : "";
+    const limit = parseBoundedInt(req.query.limit, 25, 1, 100);
+    const offset = parseBoundedInt(req.query.offset, 0, 0, 1000000);
+
+    if (action && !/^[a-z0-9._-]{1,100}$/i.test(action)) {
+        return res.status(400).json({ error: "Invalid action filter" });
+    }
+    if (!["all", "account", "post", "finance_export"].includes(targetType)) {
+        return res.status(400).json({ error: "Invalid target type filter" });
+    }
+    let targetId = null;
+    if (targetIdText) {
+        if (!/^\d+$/.test(targetIdText)) {
+            return res.status(400).json({ error: "Invalid target ID" });
+        }
+        targetId = Number.parseInt(targetIdText, 10);
+        if (!Number.isInteger(targetId) || targetId <= 0) {
+            return res.status(400).json({ error: "Invalid target ID" });
+        }
+    }
+    if (from && !isValidDateOnly(from)) {
+        return res.status(400).json({ error: "Invalid from date" });
+    }
+    if (to && !isValidDateOnly(to)) {
+        return res.status(400).json({ error: "Invalid to date" });
+    }
+    if (from && to && from > to) {
+        return res.status(400).json({ error: "from must be before or equal to to" });
+    }
+    if (from && to) {
+        const rangeDays = Math.floor(
+            (new Date(`${to}T00:00:00.000Z`).getTime() - new Date(`${from}T00:00:00.000Z`).getTime()) / 86400000
+        ) + 1;
+        if (rangeDays > 366) {
+            return res.status(400).json({ error: "Date range cannot exceed 366 days" });
+        }
+    }
+    if (limit === null) {
+        return res.status(400).json({ error: "Limit must be between 1 and 100" });
+    }
+    if (offset === null) {
+        return res.status(400).json({ error: "Offset is invalid" });
+    }
+
+    const where = [];
+    const params = [];
+    if (q) {
+        const escaped = escapeLikeValue(q);
+        params.push(q, `%${escaped}%`, `%${escaped}%`, `%${escaped}%`);
+        where.push(`(
+            a.target_id::text = $${params.length - 3}
+            OR u.name ILIKE $${params.length - 2}
+            OR u.email ILIKE $${params.length - 2}
+            OR a.action ILIKE $${params.length - 1}
+            OR a.reason ILIKE $${params.length}
+        )`);
+    }
+    if (action) {
+        params.push(action);
+        where.push(`a.action = $${params.length}`);
+    }
+    if (targetType !== "all") {
+        params.push(targetType);
+        where.push(`a.target_type = $${params.length}`);
+    }
+    if (targetId !== null) {
+        params.push(targetId);
+        where.push(`a.target_id = $${params.length}`);
+    }
+    if (from) {
+        params.push(from);
+        where.push(`a.created_at >= $${params.length}::date`);
+    }
+    if (to) {
+        params.push(to);
+        where.push(`a.created_at < ($${params.length}::date + INTERVAL '1 day')`);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    try {
+        const countResult = await pool.query(
+            `SELECT COUNT(*)::int AS total
+             FROM admin_audit_log a
+             LEFT JOIN users u ON u.id = a.actor_id
+             ${whereSql}`,
+            params
+        );
+        const total = Number(countResult.rows[0]?.total) || 0;
+
+        const dataResult = await pool.query(
+            `SELECT
+                a.id, a.action, a.target_type, a.target_id, a.reason,
+                a.before_state, a.after_state, a.request_id, a.created_at,
+                a.actor_id, u.name AS actor_name, u.email AS actor_email
+             FROM admin_audit_log a
+             LEFT JOIN users u ON u.id = a.actor_id
+             ${whereSql}
+             ORDER BY a.created_at DESC, a.id DESC
+             LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+            [...params, limit, offset]
+        );
+
+        res.json({
+            items: dataResult.rows.map((row) => ({
+                id: row.id,
+                action: row.action,
+                targetType: row.target_type,
+                targetId: row.target_id,
+                reason: row.reason || null,
+                beforeState: row.before_state || null,
+                afterState: row.after_state || null,
+                requestId: row.request_id || null,
+                createdAt: row.created_at || null,
+                actor: row.actor_name
+                    ? { id: row.actor_id, name: row.actor_name, email: row.actor_email }
+                    : null
+            })),
+            pagination: {
+                limit,
+                offset,
+                total,
+                page: Math.floor(offset / limit) + 1,
+                pages: total === 0 ? 0 : Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        console.error("Admin audit log error:", error);
+        res.status(500).json({ error: "Failed to load admin audit log" });
     }
 });
 
@@ -6154,10 +6578,17 @@ app.get("/api/admin/accounts", authenticateToken, requirePermission("accounts.re
 
         if (q) {
             const escaped = escapeLikeValue(q);
+            const handleQuery = q.startsWith("@") ? q.slice(1) : q;
             const idParam = params.length + 1;
             const likeParam = params.length + 2;
-            params.push(q, `%${escaped}%`, `%${escaped}%`);
-            where.push(`(u.id::text = $${idParam} OR u.name ILIKE $${likeParam} OR u.email ILIKE $${likeParam + 1})`);
+            if (handleQuery) {
+                const escapedHandle = escapeLikeValue(handleQuery);
+                params.push(q, `%${escaped}%`, `%${escaped}%`, `%${escapedHandle}%`);
+                where.push(`(u.id::text = $${idParam} OR u.name ILIKE $${likeParam} OR u.email ILIKE $${likeParam + 1} OR u.username ILIKE $${likeParam + 2})`);
+            } else {
+                params.push(q, `%${escaped}%`, `%${escaped}%`);
+                where.push(`(u.id::text = $${idParam} OR u.name ILIKE $${likeParam} OR u.email ILIKE $${likeParam + 1})`);
+            }
         }
         if (status !== "all") {
             params.push(status);
@@ -6202,7 +6633,7 @@ app.get("/api/admin/accounts", authenticateToken, requirePermission("accounts.re
         const dataParams = [...params, limit, offset];
         const dataResult = await pool.query(
             `SELECT
-                u.id, u.name, u.email, u.role, u.is_creator, u.is_active_creator,
+                u.id, u.name, u.email, u.username, u.role, u.is_creator, u.is_active_creator,
                 u.account_type, u.account_status, u.account_status_reason,
                 u.account_status_updated_at, u.created_at, u.credits, u.badge_level,
                 u.active_until,
@@ -6248,7 +6679,7 @@ app.get("/api/admin/accounts/:id", authenticateToken, requirePermission("account
     try {
         const result = await pool.query(
             `SELECT
-                u.id, u.name, u.email, u.role, u.is_creator, u.is_active_creator,
+                u.id, u.name, u.email, u.username, u.role, u.is_creator, u.is_active_creator,
                 u.account_type, u.account_status, u.account_status_reason,
                 u.account_status_updated_at, u.account_status_updated_by,
                 u.created_at, u.credits, u.badge_level, u.active_until, u.last_sale_at,
