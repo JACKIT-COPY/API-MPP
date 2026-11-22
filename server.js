@@ -23,6 +23,8 @@ emailService.initEmailService();
 
 const app = express();
 const port = process.env.PORT || 3000;
+// Previous backend URL: https://api-mpp.onrender.com
+const apiBaseUrl = (process.env.API_BASE_URL || "https://api-mpp-h5gq.onrender.com").replace(/\/+$/, "");
 const secretKey = process.env.JWT_SECRET || "your-secret-key";
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const upload = multer({ storage: multer.memoryStorage() });
@@ -1900,7 +1902,7 @@ app.post("/subscribe", authenticateToken, async (req, res) => {
             const phoneNumber = payment_details.phone;
 
             const stkResponse = await axios.post(
-                `${process.env.API_BASE_URL || 'https://mpp-backend-service.onrender.com'}/api/mpesa/stkpush`,
+                `${apiBaseUrl}/api/mpesa/stkpush`,
                 { subscriptionId, amount: validatedAmount, phoneNumber },
                 { headers: { Authorization: `Bearer ${req.headers.authorization.split(' ')[1]}` } }
             );
@@ -10417,7 +10419,7 @@ app.post("/api/cohost/pay", authenticateToken, requireAccountType("creator", "bu
                     PartyA: phoneNumber,
                     PartyB: process.env.PAYBILL_NUMBER,
                     PhoneNumber: phoneNumber,
-                    CallBackURL: `${process.env.API_BASE_URL || 'https://mpp-backend-service.onrender.com'}/api/mpesa/callback_cohost`,
+                    CallBackURL: `${apiBaseUrl}/api/mpesa/callback_cohost`,
                     AccountReference: `MPP_CoHost_${requestId}`,
                     TransactionDesc: 'MyPaidPost Co-Host Payment'
                 },
@@ -10659,7 +10661,7 @@ app.post("/api/campaigns", authenticateToken, requireAccountType("business"), as
                     PartyA: formattedPhone,
                     PartyB: process.env.PAYBILL_NUMBER,
                     PhoneNumber: formattedPhone,
-                    CallBackURL: `${process.env.API_BASE_URL || 'https://mpp-backend-service.onrender.com'}/api/mpesa/callback`,
+                    CallBackURL: `${apiBaseUrl}/api/mpesa/callback`,
                     AccountReference: `MPP_Camp_${campaignId}`,
                     TransactionDesc: 'MyPaidPost Campaign Escrow'
                 },
